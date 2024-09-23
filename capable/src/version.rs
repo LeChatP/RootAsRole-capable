@@ -1,1 +1,1 @@
-pub const LINUX_VERSION_CODE: u32 = 395528;
+pub const LINUX_VERSION_CODE: u32 = 395786;
