@@ -30,7 +30,7 @@ fn main() {
     };
 
     if let Err(e) = ret {
-        eprintln!("{e:#}");
+        warn!("{e:#}");
         exit(1);
     }
 }
