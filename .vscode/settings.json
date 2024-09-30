@@ -1,0 +1,15 @@
+{
+    "rust-analyzer.linkedProjects": [
+        //"sudoers-reader/Cargo.toml",
+        "Cargo.toml",
+        "./capable-ebpf/Cargo.toml"
+    ],
+    "c-cpp-flylint.clang.includePaths": [
+        "${workspaceFolder}/src"
+    ],
+    "terminal.integrated.env.linux": {
+        "PROFILE" : "debug",
+        "RUST_BACKTRACE" : "1",
+    },
+    "rust-analyzer.checkOnSave": true
+}
