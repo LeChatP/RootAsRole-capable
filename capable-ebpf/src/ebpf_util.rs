@@ -3,8 +3,9 @@ use aya_ebpf::{
     macros::map,
     maps::array::Array,
 };
-use crate::open::PidPtr;
-use crate::vmlinux::{ns_common, nsproxy, pid_namespace, task_struct};
+use crate::vmlinux::{ns_common, nsproxy, pid, pid_namespace, task_struct};
+
+pub type PidPtr = *mut pid;
 
 #[map]
 static mut NAMESPACE_ID: Array<u32> = Array::with_max_entries(1, 0);

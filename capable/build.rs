@@ -1,4 +1,4 @@
-use std::{error::Error, fs, io};
+use std::{error::Error, fs};
 
 use aya::util::KernelVersion;
 

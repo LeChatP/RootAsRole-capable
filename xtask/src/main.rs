@@ -30,7 +30,7 @@ fn main() {
     };
 
     if let Err(e) = ret {
-        warn!("{e:#}");
+        //warn!("{e:#}");
         exit(1);
     }
 }

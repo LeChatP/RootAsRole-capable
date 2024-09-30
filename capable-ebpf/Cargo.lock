@@ -83,7 +83,7 @@ checksum = "b048fb63fd8b5923fc5aa7b340d8e156aec7ec02f0c78fa8a6ddc2613f6f71de"
 
 [[package]]
 name = "capable-common"
-version = "3.0.0-alpha.5"
+version = "3.0.0"
 dependencies = [
  "aya-ebpf",
  "bitflags",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "capable-ebpf"
-version = "3.0.0-alpha.5"
+version = "3.0.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",

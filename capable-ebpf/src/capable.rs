@@ -20,7 +20,6 @@ static mut PPID_MAP: HashMap<Key, i32> = HashMap::with_max_entries(MAX_PID, 0);
 #[map]
 static mut PNSID_NSID_MAP: HashMap<Key, u64> = HashMap::with_max_entries(MAX_PID, 0);
 
-
 pub fn try_capable(ctx: &ProbeContext) -> Result<u32, i64> {
     unsafe {
         let task: TaskStructPtr = bpf_get_current_task() as TaskStructPtr;

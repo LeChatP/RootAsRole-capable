@@ -1,29 +1,30 @@
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::error::Error;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::{canonicalize, metadata};
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+use aya::maps::{Array, HashMap, MapData};
+use aya::programs::KProbe;
+use aya::util::KernelVersion;
+use aya::{include_bytes_aligned, Ebpf};
+use aya_log::EbpfLogger;
+use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
+use log::{debug, warn};
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
+use nix::unistd::{getpid, Uid};
+use serde::{Deserialize, Serialize};
+use strace::read_strace;
+use syscalls::SyscallAccessEntry;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, thread, vec};
-use std::panic::set_hook;
-use aya::maps::{Array, HashMap, Map, MapData};
-use aya::programs::{KProbe, Program};
-use aya::util::KernelVersion;
-use aya::{include_bytes_aligned, Ebpf, Pod};
-use aya_log::EbpfLogger;
-use capable_common::{NsId, Request};
-use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
-use log::{debug, warn};
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::Uid;
-use serde::{Deserialize, Serialize};
 use tabled::settings::object::Columns;
+use unshare::ExitStatus;
 
 use tabled::settings::{Modify, Style, Width};
 use tabled::{Table, Tabled};
@@ -35,6 +36,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 type Key = i32;
 
 mod version;
+mod syscalls;
+mod strace;
 
 struct Cli {
     /// Specify a delay before killing the process
@@ -172,18 +175,23 @@ fn print_program_capabilities<T>(
     capabilities_map: &HashMap<T, Key, u64>,
     pnsid_nsid_map: &HashMap<T, Key, u64>,
     json: bool,
+    filter_pid: i32,
 ) -> Result<(), Box<dyn Error>>
 where
     T: Borrow<MapData>,
 {
     let mut graph = std::collections::HashMap::new();
     let mut init = CapSet::empty();
-    setbpf_effective(true);
+    setbpf_effective(true)?;
     for key in capabilities_map.keys() {
         let pid = key.inspect_err(|err| {
             eprintln!("Failed to get pid : {:?}", err.to_string());
             exit(-1);
         })?;
+        if filter_pid == pid {
+            debug!("Ignoring pid {}, as it is sh or strace", pid);
+            continue;
+        }
         let pinum_inum = pnsid_nsid_map.get(&pid, 0).unwrap_or(0);
         let child = pinum_inum as u32;
         let parent = (pinum_inum >> 32) as u32;
@@ -195,7 +203,7 @@ where
             init = caps_from_u64(capabilities_map.get(&pid, 0).unwrap_or(0));
         }
     }
-    setbpf_effective(false);
+    setbpf_effective(false)?;
     let result = init.union(union_all_childs(*nsinode, &graph));
     if json {
         println!("{}", serde_json::to_string(&capset_to_vec(&result))?);
@@ -224,19 +232,29 @@ where
     })
 }
 
+fn find_strace() -> Option<PathBuf> {
+    find_from_envpath(&"strace".to_string())
+}
+
 fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
-    let mut exec_path = command[0].parse().unwrap();
-    let exec_args;
-    if let Some(program) = find_from_envpath(&command[0]) {
-        exec_path = program;
-        exec_args = command[1..].to_vec();
+    let mut exec_path: PathBuf = command[0].parse().unwrap();
+    let mut exec_args;
+    // encapsulate the command in sh command
+    command[0] = canonicalize(exec_path.clone())
+        .unwrap_or(exec_path)
+        .to_str()
+        .unwrap()
+        .to_string();
+    if let Some(strace) = find_strace() {
+        exec_path = strace;
+        exec_args = vec![
+            "-e".to_string(),
+            "file".to_string(),
+            "-o".to_string(),
+            format!("/tmp/capable_strace_{}.log", getpid()),
+        ];
+        exec_args.extend(command.clone());
     } else {
-        // encapsulate the command in sh command
-        command[0] = canonicalize(exec_path.clone())
-            .unwrap_or(exec_path)
-            .to_str()
-            .unwrap()
-            .to_string();
         exec_path = PathBuf::from("/bin/sh");
         exec_args = vec!["-c".to_string(), shell_words::join(command)];
     }
@@ -374,7 +392,7 @@ fn setresource_effective(enable: bool) -> Result<(), capctl::Error> {
     })
 }
 
-fn setptrace_effective(enable: bool) -> Result<(), capctl::Error> {
+pub fn setptrace_effective(enable: bool) -> Result<(), capctl::Error> {
     cap_effective(Cap::SYS_PTRACE, enable).inspect_err(|_| {
         eprintln!("{}", cap_effective_error("SYS_PTRACE"));
     })
@@ -430,7 +448,8 @@ fn run_command(
     cli_args: &mut Cli,
     nsclone: Rc<RefCell<u32>>,
     config_map: Rc<RefCell<Array<MapData, u32>>>,
-) -> Result<i32, anyhow::Error> {
+    pid: &mut i32,
+) -> Result<ExitStatus, anyhow::Error> {
     let (path, args) = get_exec_and_args(&mut cli_args.command);
     let namespaces = vec![&unshare::Namespace::Pid];
     let capabilities = cli_args.capabilities.clone();
@@ -487,13 +506,14 @@ fn run_command(
     ));
     setadmin_effective(false)?;
     let cloned = child.clone();
-    let pid = child.try_lock().unwrap().id() as i32;
+    *pid = child.try_lock().unwrap().id() as i32;
+    let pid_cloned = pid.clone();
 
     thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(signal::ctrl_c())
             .expect("failed to wait for ctrl-c");
-        let nixpid = nix::unistd::Pid::from_raw(pid);
+        let nixpid = nix::unistd::Pid::from_raw(pid_cloned);
         nix::sys::signal::kill(nixpid, nix::sys::signal::Signal::SIGINT)
             .expect("failed to send SIGINT");
         let mut i = 0;
@@ -535,11 +555,7 @@ fn run_command(
     debug!("child exited with {:?}", exit_status);
     //print_all(&capabilities_map, &pnsid_nsid_map, &uid_gid_map, &ppid_map)?;
 
-    if exit_status.success() {
-        Ok(0)
-    } else {
-        Ok(exit_status.code().unwrap_or(-1))
-    }
+    Ok(exit_status)
 }
 
 fn load_and_attach_program(
@@ -605,7 +621,7 @@ pub fn subsribe(tool: &str) {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     subsribe("capable");
-    ambient::clear().expect("Failed to clear ambiant caps");
+    //ambient::clear().expect("Failed to clear ambiant caps");
     debug!("capable started");
 
     if KernelVersion::current()?.code() != version::LINUX_VERSION_CODE {
@@ -623,10 +639,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
     debug!("setting capabilities");
 
-    let mut capstate = CapState::get_current().expect("Failed to get current cap");
-    capstate.inheritable = CapSet::empty();
-    capstate.effective = CapSet::empty();
-    capstate.set_current().expect("Failed to set current cap");
+    //let mut capstate = CapState::get_current().expect("Failed to get current cap");
+    //capstate.inheritable = CapSet::empty();
+    //capstate.effective = CapSet::empty();
+    //capstate.set_current().expect("Failed to set current cap");
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -662,16 +678,9 @@ async fn main() -> Result<(), anyhow::Error> {
         warn!("failed to initialize eBPF {}", e);
     }
     load_and_attach_program(&mut bpf, "capable", "cap_capable", 0)?;
-    load_and_attach_program(&mut bpf, "acl_may_open", "may_open", 0)?;
-    load_and_attach_program(&mut bpf, "acl_may_create", "may_create", 0)?;
-    load_and_attach_program(&mut bpf, "acl_may_delete", "may_delete", 0)?;
-    load_and_attach_program(&mut bpf, "acl_may_linkat", "may_linkat", 0)?;
-    load_and_attach_program(&mut bpf, "acl_link_path_walk", "link_path_walk", 0)?;
-    load_and_attach_program(&mut bpf, "acl_pick_link", "pick_link", 0)?;
     let config_map: Rc<RefCell<Array<MapData, _>>> = Rc::new(RefCell::new(Array::try_from(
         bpf.take_map("NAMESPACE_ID").unwrap(),
     )?));
-    let requests: Array<_, Request> = Array::try_from(bpf.map("REQUESTS").unwrap())?;
     let capabilities_map: HashMap<_, Key, u64> =
         HashMap::try_from(bpf.borrow().map("CAPABILITIES_MAP").unwrap())?;
     let pnsid_nsid_map: HashMap<_, Key, u64> =
@@ -697,15 +706,36 @@ async fn main() -> Result<(), anyhow::Error> {
             )?;
         } else {
             let nsinode: Rc<RefCell<u32>> = Rc::new(0.into());
-            run_command(&mut cli_args, nsinode.clone(), config_map)?;
-
+            let mut pid= 0;
+            let exit = run_command(&mut cli_args, nsinode.clone(), config_map, &mut pid)?;
+            if !exit.success() && !cli_args.json {
+                eprintln!("Command failed with exit status: {}", exit);
+                eprintln!("Please check the command and try again with requested capabilities as you want to reach");
+            }
+            //delete pid from maps
             print_program_capabilities(
                 &nsinode.as_ref().borrow(),
                 &capabilities_map,
                 &pnsid_nsid_map,
                 cli_args.json,
+                pid,
             )
             .expect("failed to print capabilities");
+
+            let access: Vec<SyscallAccessEntry> = read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?.iter().map(|syscall| {
+                syscalls::syscall_to_entry(syscall)
+            }).flatten().collect();
+            let mut map = std::collections::HashMap::new();
+            for entry in access {
+                let key = entry.path.clone();
+                let value = entry.access;
+                *map.entry(key).or_insert(value) |= entry.access;
+            }
+            if cli_args.json {
+                println!("{}", serde_json::to_string(&map)?);
+            } else {
+                println!("Here's all DAC requests intercepted for this program :\n{}", map.iter().map(|(k, v)| format!("{} : {}", k, v)).collect::<Vec<String>>().join("\n"));
+            }
         }
     }
     Ok(())
