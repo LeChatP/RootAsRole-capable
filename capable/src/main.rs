@@ -12,6 +12,7 @@ use aya::programs::KProbe;
 use aya::util::KernelVersion;
 use aya::{include_bytes_aligned, Ebpf};
 use aya_log::EbpfLogger;
+use capable_common::Access;
 use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
 use log::{debug, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
@@ -170,13 +171,12 @@ fn union_all_childs(
     result
 }
 
-fn print_program_capabilities<T>(
+fn program_capabilities<T>(
     nsinode: &u32,
     capabilities_map: &HashMap<T, Key, u64>,
     pnsid_nsid_map: &HashMap<T, Key, u64>,
-    json: bool,
     filter_pid: i32,
-) -> Result<(), Box<dyn Error>>
+) -> Result<CapSet, Box<dyn Error>>
 where
     T: Borrow<MapData>,
 {
@@ -205,13 +205,7 @@ where
     }
     setbpf_effective(false)?;
     let result = init.union(union_all_childs(*nsinode, &graph));
-    if json {
-        println!("{}", serde_json::to_string(&capset_to_vec(&result))?);
-    } else {
-        println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
-        capset_to_string(&result));
-    }
-    Ok(())
+    Ok(result)
 }
 
 fn find_from_envpath<P>(exe_name: &P) -> Option<PathBuf>
@@ -624,6 +618,12 @@ pub fn subsribe(tool: &str) {
     }));
 }
 
+#[derive(Serialize)]
+struct ProgramResult {
+    capabilities: Vec<String>,
+    files: std::collections::HashMap<String, syscalls::Access>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     subsribe("capable");
@@ -718,12 +718,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 eprintln!("Command failed with exit status: {}", exit);
                 eprintln!("Please check the command and try again with requested capabilities as you want to reach");
             }
+
+            let capset = 
             //delete pid from maps
-            print_program_capabilities(
+            program_capabilities(
                 &nsinode.as_ref().borrow(),
                 &capabilities_map,
                 &pnsid_nsid_map,
-                cli_args.json,
                 pid,
             )
             .expect("failed to print capabilities");
@@ -738,8 +739,14 @@ async fn main() -> Result<(), anyhow::Error> {
                 *map.entry(key).or_insert(value) |= entry.access;
             }
             if cli_args.json {
-                println!("{}", serde_json::to_string(&map)?);
+                let result = ProgramResult {
+                    capabilities: capset_to_vec(&capset),
+                    files: map,
+                };
+                println!("{}", serde_json::to_string(&result)?);
             } else {
+                println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
+                capset_to_string(&capset));
                 println!("Here's all DAC requests intercepted for this program :\n{}", map.iter().map(|(k, v)| format!("{} : {}", k, v)).collect::<Vec<String>>().join("\n"));
             }
         }
