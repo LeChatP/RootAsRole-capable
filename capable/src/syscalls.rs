@@ -1,14 +1,15 @@
-use std::path::Display;
+use std::{fs, os::linux::fs::MetadataExt, path::{Display, Path}};
 
 use bitflags::bitflags;
+use log::warn;
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, info_span};
 
-use crate::strace::Syscall;
+use crate::{dac_read_search_effective, strace::Syscall};
 
 bitflags! {
     #[derive(PartialEq, Clone)]
-    pub struct Pos: u32 {
+    pub struct Pos: u8 {
         const One       = 0b1;
         const Two       = 0b10;
         const Three     = 0b100;
@@ -25,14 +26,14 @@ impl Into<usize> for Pos {
             Pos::Three => 2,
             Pos::Four => 3,
             Pos::Five => 4,
-            _ => 0,
+            _ => panic!("Invalid conversion"),
         }
     }
 }
 
 bitflags! {
     #[derive(Clone, Copy)]
-    pub struct Access: u32 {
+    pub struct Access: u8 {
         const R   = 0b100;
         const W   = 0b010;
         const X   = 0b001;
@@ -40,6 +41,12 @@ bitflags! {
         const RX  = 0b101;
         const WX  = 0b011;
         const RWX = 0b111;
+    }
+}
+
+impl PartialEq for Access {
+    fn eq(&self, other: &Self) -> bool {
+        self.bits() == other.bits()
     }
 }
 
@@ -165,7 +172,7 @@ pub const CALLS: [(&str,Pos,Access);130] = [
     ("stat64",				Pos::empty(),	Access::empty()),
     ("statfs",				Pos::empty(),	Access::empty()),
     ("statfs64",			Pos::empty(),	Access::empty()),
-    ("statx",				Pos::empty(),	Access::empty()),
+    ("statx",				Pos::Two,	Access::empty()),
     ("svr4_fstat",			Pos::empty(),	Access::empty()),
     ("svr4_fstatfs",		Pos::empty(),	Access::empty()),
     ("svr4_fstatvfs",		Pos::empty(),	Access::empty()),
@@ -204,14 +211,16 @@ pub const CALLS: [(&str,Pos,Access);130] = [
     ("utimes",				Pos::One,	    Access::W),
 ];
 
+
 pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
-    if syscall.return_code.code == -1 {
-        return None
-    }
+    
     for (name, pos, access) in CALLS.iter() {
+        if pos.is_empty() {
+            continue;
+        }
         if name == &syscall.syscall {
+            let path = syscall.args.clone().into_iter().nth((*pos).clone().into()).unwrap().to_string();
             let mut access = access.clone();
-            debug!("Found syscall: {}", name);
             match *name {
                 "open" | "openat" | "openat2" => {
                     let flags = if syscall.args.len() > 2 {
@@ -221,18 +230,45 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
                     };
                     if flags.contains("O_RDONLY") {
                         access |= Access::R;
+                        debug!("Found O_RDONLY");
                     }
                     if flags.contains("O_WRONLY") | flags.contains("O_CREAT") {
                         access |= Access::W;
+                        debug!("Found O_WRONLY | O_CREAT");
                     }
                     if flags.contains("O_RDWR") {
                         access |= Access::RW;
+                        debug!("Found O_RDWR");
                     }
                 },
                 _ => {}
             }
+            if access.is_empty() {
+                continue;
+            }
+            debug!("{} is requesting {} at {}", name, access, path);
+            if syscall.return_code.constant.as_ref().and_then(|r| if r == "ENOENT" { Some(r) } else { None } ).is_some() {
+                debug!("Ignoring {} with ENOENT", path);
+                return None
+            }
+            // retrieve POSIX access rights
+            let _ = dac_read_search_effective(true);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    let mode = Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().unwrap());
+                    // if mode is a superset then None
+                    if access.intersection(mode).eq(&access) {
+                        debug!("{} has {} rights for others, so ignoring", path, mode);
+                        return None;
+                    }
+                },
+                Err(_) => { warn!("Cannot retrieve metadata for path: {}", path); return None; }
+            }
+            let _ = dac_read_search_effective(false);
+            
+
             return Some(SyscallAccessEntry {
-                path: syscall.args.clone().into_iter().nth((*pos).clone().into()).unwrap().to_string(),
+                path,
                 access,
                 syscall: syscall.syscall.clone(),
             })

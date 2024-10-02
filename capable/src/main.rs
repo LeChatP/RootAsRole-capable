@@ -362,10 +362,16 @@ fn cap_effective_error(caplist: &str) -> String {
     )
 }
 
-fn cap_effective(cap: Cap, enable: bool) -> Result<(), capctl::Error> {
+pub fn cap_effective(cap: Cap, enable: bool) -> Result<(), capctl::Error> {
     let mut current = CapState::get_current()?;
     current.effective.set_state(cap, enable);
     current.set_current()
+}
+
+pub fn dac_read_search_effective(enable: bool) -> Result<(), capctl::Error> {
+    cap_effective(Cap::DAC_READ_SEARCH, enable).inspect_err(|_| {
+        eprintln!("{}", cap_effective_error("DAC_READ_SEARCH"));
+    })
 }
 
 fn setpcap_effective(enable: bool) -> Result<(), capctl::Error> {
