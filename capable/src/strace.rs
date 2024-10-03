@@ -4,8 +4,6 @@ use pest::Parser;
 use pest_derive::Parser;
 use tracing::{debug, warn};
 
-
-
 pub struct Syscall {
     pub syscall: String,
     pub args: Vec<Parameter>,
@@ -43,7 +41,7 @@ pub struct ReturnCode {
 #[grammar = "strace.pest"]
 struct StraceParser;
 
-pub fn read_strace<P:AsRef<Path>>(path : P) -> std::io::Result<Vec<Syscall>> {
+pub fn read_strace<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<Syscall>> {
     debug!("Reading strace file: {:?}", path.as_ref());
     let binding = fs::read_to_string(path)?;
     debug!("Parsing strace file");
@@ -53,11 +51,10 @@ pub fn read_strace<P:AsRef<Path>>(path : P) -> std::io::Result<Vec<Syscall>> {
         match pair.as_rule() {
             Rule::syscall_call => {
                 parse_syscall(pair, &mut syscalls);
-            },
+            }
             Rule::EOI | Rule::exit => (),
             _ => warn!("Unexpected rule: {:?}", pair.as_rule()),
         }
-        
     }
     Ok(syscalls)
 }
@@ -76,17 +73,25 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
         match pair.as_rule() {
             Rule::syscall => syscall.syscall = pair.as_str().to_string(),
             Rule::array => {
-                syscall.args.push(Parameter::Array(pair.into_inner().map(|x| x.as_str().to_string()).collect()));
-            },
+                syscall.args.push(Parameter::Array(
+                    pair.into_inner().map(|x| x.as_str().to_string()).collect(),
+                ));
+            }
             Rule::string => {
-                syscall.args.push(Parameter::String(pair.as_str().to_string()));
-            },
+                syscall
+                    .args
+                    .push(Parameter::String(pair.as_str().to_string()));
+            }
             Rule::constant => {
-                syscall.args.push(Parameter::Constant(pair.as_str().to_string()));
-            },
+                syscall
+                    .args
+                    .push(Parameter::Constant(pair.as_str().to_string()));
+            }
             Rule::comment => {
-                syscall.args.push(Parameter::Comment(pair.as_str().to_string()));
-            },
+                syscall
+                    .args
+                    .push(Parameter::Comment(pair.as_str().to_string()));
+            }
             Rule::structure => {
                 let mut map = HashMap::new();
                 let mut inner = pair.into_inner();
@@ -96,29 +101,35 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
                             let key = inner_pair.as_str().to_string();
                             let value = inner.next().unwrap().as_str().to_string();
                             map.insert(key, value);
-                        },
+                        }
                         _ => {
                             warn!("Unexpected rule: {:?}", inner_pair.as_rule());
-                        },
+                        }
                     }
                 }
                 syscall.args.push(Parameter::Dict(map));
-            },
+            }
             Rule::return_code => {
                 for inner_pair in pair.into_inner() {
                     match inner_pair.as_rule() {
-                        Rule::return_value => syscall.return_code.code = inner_pair.as_str().trim().parse().unwrap(),
-                        Rule::constant => syscall.return_code.constant = Some(inner_pair.as_str().to_string()),
-                        Rule::message => syscall.return_code.message = Some(inner_pair.as_str().to_string()),
+                        Rule::return_value => {
+                            syscall.return_code.code = inner_pair.as_str().trim().parse().unwrap()
+                        }
+                        Rule::constant => {
+                            syscall.return_code.constant = Some(inner_pair.as_str().to_string())
+                        }
+                        Rule::message => {
+                            syscall.return_code.message = Some(inner_pair.as_str().to_string())
+                        }
                         _ => {
                             warn!("Unexpected rule: {:?}", inner_pair.as_rule());
-                        },
+                        }
                     }
                 }
-            },
+            }
             _ => {
                 warn!("Unexpected rule: {:?}", pair.as_rule());
-            },
+            }
         }
     }
     syscalls.push(syscall);

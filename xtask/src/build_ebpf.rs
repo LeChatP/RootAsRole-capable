@@ -1,5 +1,6 @@
 use std::{path::PathBuf, process::Command};
 
+use anyhow::Context;
 use clap::Parser;
 
 #[derive(Debug, Copy, Clone)]
@@ -39,15 +40,22 @@ pub struct Options {
     pub release: bool,
 }
 
+fn generate_vmlinux() -> Result<(), anyhow::Error> {
+    let output = Command::new("aya-tool")
+        .args(&["generate", "task_struct"])
+        .output()
+        .context("failed to run aya-tool")?;
+    let string = String::from_utf8(output.stdout)?.replace("aya_bpf::", "aya_ebpf::");
+    // write to file
+    std::fs::write("capable-ebpf/src/vmlinux.rs", string)?;
+    Ok(())
+}
+
 pub fn build_ebpf(opts: Options) -> Result<(), anyhow::Error> {
+    generate_vmlinux()?;
     let dir = PathBuf::from("capable-ebpf");
     let target = format!("--target={}", opts.target);
-    let mut args = vec![
-        "build",
-        target.as_str(),
-        "-Z",
-        "build-std=core",
-    ];
+    let mut args = vec!["build", target.as_str(), "-Z", "build-std=core"];
     if opts.release {
         args.push("--release")
     }

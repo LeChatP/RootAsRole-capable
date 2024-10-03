@@ -10,3 +10,4 @@ target/
 .vagrant/
 .env
 capable/src/version.rs
+capable-ebpf/src/vmlinux.rs

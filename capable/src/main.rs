@@ -18,12 +18,12 @@ use log::{debug, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{getpid, Uid};
 use serde::{Deserialize, Serialize};
-use strace::read_strace;
-use syscalls::SyscallAccessEntry;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, thread, vec};
+use strace::read_strace;
+use syscalls::SyscallAccessEntry;
 use tabled::settings::object::Columns;
 use unshare::ExitStatus;
 
@@ -36,9 +36,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 type Key = i32;
 
-mod version;
-mod syscalls;
 mod strace;
+mod syscalls;
+mod version;
 
 struct Cli {
     /// Specify a delay before killing the process
@@ -188,19 +188,20 @@ where
             eprintln!("Failed to get pid : {:?}", err.to_string());
             exit(-1);
         })?;
-        if filter_pid == pid {
-            debug!("Ignoring pid {}, as it is sh or strace", pid);
-            continue;
-        }
         let pinum_inum = pnsid_nsid_map.get(&pid, 0).unwrap_or(0);
         let child = pinum_inum as u32;
         let parent = (pinum_inum >> 32) as u32;
-        graph.entry(parent).or_insert_with(Vec::new).push((
-            child,
-            caps_from_u64(capabilities_map.get(&pid, 0).unwrap_or(0)),
-        ));
+        let caps = caps_from_u64(if filter_pid == pid {
+            0
+        } else {
+            capabilities_map.get(&pid, 0).unwrap_or(0)
+        });
+        graph
+            .entry(parent)
+            .or_insert_with(Vec::new)
+            .push((child, caps));
         if child == *nsinode {
-            init = caps_from_u64(capabilities_map.get(&pid, 0).unwrap_or(0));
+            init = caps;
         }
     }
     setbpf_effective(false)?;
@@ -447,7 +448,6 @@ where
 fn run_command(
     cli_args: &mut Cli,
     nsclone: Rc<RefCell<u32>>,
-    config_map: Rc<RefCell<Array<MapData, u32>>>,
     pid: &mut i32,
 ) -> Result<ExitStatus, anyhow::Error> {
     let (path, args) = get_exec_and_args(&mut cli_args.command);
@@ -479,10 +479,6 @@ fn run_command(
                     metadata(format!("/proc/{}/ns/pid", id)).expect("failed to open pid ns");
                 setptrace_effective(false)?;
                 nsclone.as_ref().replace(fnspid.ino() as u32);
-                config_map
-                    .as_ref()
-                    .borrow_mut()
-                    .set(0, fnspid.ino() as u32, 0)?;
                 Ok(())
             })
             .unshare(namespaces)
@@ -558,24 +554,6 @@ fn run_command(
     Ok(exit_status)
 }
 
-fn load_and_attach_program(
-    bpf: &mut Ebpf,
-    call: &str,
-    fn_name: &str,
-    offset: u64,
-) -> Result<(), anyhow::Error> {
-    debug!("loading and attaching program {}", call);
-    setbpf_effective(true)?;
-    setadmin_effective(true)?;
-    let program: &mut KProbe = bpf.program_mut(call).unwrap().try_into()?;
-    program.load()?;
-    program.attach(fn_name, offset)?;
-    setbpf_effective(false)?;
-    setadmin_effective(false)?;
-    debug!("program {} loaded and attached", call);
-    Ok(())
-}
-
 #[cfg(debug_assertions)]
 pub fn subsribe(tool: &str) {
     use std::io;
@@ -627,6 +605,7 @@ struct ProgramResult {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     subsribe("capable");
+    //env_logger::init();
     //ambient::clear().expect("Failed to clear ambiant caps");
     debug!("capable started");
 
@@ -683,10 +662,15 @@ async fn main() -> Result<(), anyhow::Error> {
         // This can happen if you remove all log statements from your eBPF program.
         warn!("failed to initialize eBPF {}", e);
     }
-    load_and_attach_program(&mut bpf, "capable", "cap_capable", 0)?;
-    let config_map: Rc<RefCell<Array<MapData, _>>> = Rc::new(RefCell::new(Array::try_from(
-        bpf.take_map("NAMESPACE_ID").unwrap(),
-    )?));
+    debug!("loading and attaching program {}", "capable");
+    setbpf_effective(true)?;
+    setadmin_effective(true)?;
+    let program: &mut KProbe = bpf.program_mut("capable").unwrap().try_into()?;
+    program.load()?;
+    program.attach("cap_capable", 0)?;
+    setbpf_effective(false)?;
+    setadmin_effective(false)?;
+    debug!("program {} loaded and attached", "capable");
     let capabilities_map: HashMap<_, Key, u64> =
         HashMap::try_from(bpf.borrow().map("CAPABILITIES_MAP").unwrap())?;
     let pnsid_nsid_map: HashMap<_, Key, u64> =
@@ -712,16 +696,14 @@ async fn main() -> Result<(), anyhow::Error> {
             )?;
         } else {
             let nsinode: Rc<RefCell<u32>> = Rc::new(0.into());
-            let mut pid= 0;
-            let exit = run_command(&mut cli_args, nsinode.clone(), config_map, &mut pid)?;
+            let mut pid = 0;
+            let exit = run_command(&mut cli_args, nsinode.clone(), &mut pid)?;
             if !exit.success() && !cli_args.json {
                 eprintln!("Command failed with exit status: {}", exit);
                 eprintln!("Please check the command and try again with requested capabilities as you want to reach");
             }
 
-            let capset = 
-            //delete pid from maps
-            program_capabilities(
+            let capset = program_capabilities(
                 &nsinode.as_ref().borrow(),
                 &capabilities_map,
                 &pnsid_nsid_map,
@@ -729,9 +711,12 @@ async fn main() -> Result<(), anyhow::Error> {
             )
             .expect("failed to print capabilities");
 
-            let access: Vec<SyscallAccessEntry> = read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?.iter().map(|syscall| {
-                syscalls::syscall_to_entry(syscall)
-            }).flatten().collect();
+            let access: Vec<SyscallAccessEntry> =
+                read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?
+                    .iter()
+                    .map(|syscall| syscalls::syscall_to_entry(syscall))
+                    .flatten()
+                    .collect();
             let mut map = std::collections::HashMap::new();
             for entry in access {
                 let key = entry.path.clone();
@@ -747,7 +732,13 @@ async fn main() -> Result<(), anyhow::Error> {
             } else {
                 println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
                 capset_to_string(&capset));
-                println!("Here's all DAC requests intercepted for this program :\n{}", map.iter().map(|(k, v)| format!("{} : {}", k, v)).collect::<Vec<String>>().join("\n"));
+                println!(
+                    "Here's all DAC requests intercepted for this program :\n{}",
+                    map.iter()
+                        .map(|(k, v)| format!("{} : {}", k, v))
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                );
             }
         }
     }
