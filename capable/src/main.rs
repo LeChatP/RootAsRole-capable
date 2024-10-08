@@ -1,23 +1,26 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::CString;
 use std::fs::{canonicalize, metadata};
+use std::hash::Hash;
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use aya::maps::{Array, HashMap, MapData};
+use aya::maps::{MapData, Stack, StackTraceMap};
 use aya::programs::KProbe;
-use aya::util::KernelVersion;
+use aya::util::{kernel_symbols, KernelVersion};
 use aya::{include_bytes_aligned, Ebpf};
 use aya_log::EbpfLogger;
-use capable_common::Access;
+use capable_common::{Nsid, Pid, Request};
 use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
 use log::{debug, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{getpid, Uid};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
+use tracing_subscriber::field::debug;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,8 +36,6 @@ use tokio::runtime::Runtime;
 use tokio::signal;
 use tracing::Level;
 use tracing_subscriber::util::SubscriberInitExt;
-
-type Key = i32;
 
 mod strace;
 mod syscalls;
@@ -68,11 +69,69 @@ impl Default for Cli {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CapSetEntry {
+    pub pid: Pid,
+    pub ppid: Pid,
+    pub uid: capable_common::Uid,
+    pub gid: capable_common::Gid,
+    pub ns: Nsid,
+    pub parent_ns: Nsid,
+    pub capabilities: CapSet,
+}
+
+impl CapSetEntry {
+    pub fn new(
+        pid: Pid,
+        ppid: Pid,
+        uid: capable_common::Uid,
+        gid: capable_common::Gid,
+        parent_ns: Nsid,
+        ns: Nsid,
+    ) -> CapSetEntry {
+        CapSetEntry {
+            pid,
+            ppid,
+            uid,
+            gid,
+            parent_ns,
+            ns,
+            capabilities: CapSet::empty(),
+        }
+    }
+    pub fn add(&mut self, cap: Cap) {
+        self.capabilities.add(cap);
+    }
+}
+
+impl Hash for CapSetEntry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pid.hash(state);
+        self.ppid.hash(state);
+        self.uid.hash(state);
+        self.gid.hash(state);
+        self.parent_ns.hash(state);
+        self.ns.hash(state);
+    }
+}
+
+impl PartialEq for CapSetEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.ppid == other.ppid
+            && self.uid == other.uid
+            && self.parent_ns == other.parent_ns
+            && self.ns == other.ns
+    }
+}
+
+impl Eq for CapSetEntry {}
+
 #[derive(Tabled, Serialize, Deserialize)]
 #[tabled(rename_all = "UPPERCASE")]
 struct CapabilitiesTable {
-    pid: u32,
-    ppid: u32,
+    pid: Pid,
+    ppid: i32,
     uid: String,
     gid: String,
     ns: u32,
@@ -159,54 +218,51 @@ fn caps_from_u64(caps: u64) -> CapSet {
 
 fn union_all_childs(
     nsinode: u32,
-    graph: &std::collections::HashMap<u32, Vec<(u32, CapSet)>>,
+    graph: &std::collections::HashMap<u32, Vec<u32>>,
+    cap_graph: &std::collections::HashMap<u32, CapSet>,
 ) -> CapSet {
     let mut result = CapSet::empty();
     for ns in graph.get(&nsinode).unwrap_or(&Vec::new()) {
-        result = result.union(ns.1);
-        if graph.contains_key(&ns.0) && ns.0 != nsinode {
-            result = result.union(union_all_childs(ns.0, graph));
+        result |= *cap_graph.get(ns).unwrap_or(&CapSet::empty());
+        if graph.contains_key(&ns) && *ns != nsinode {
+            result |= union_all_childs(*ns, graph, cap_graph);
         }
     }
     result
 }
 
-fn program_capabilities<T>(
+fn program_capabilities<T,V>(
     nsinode: &u32,
-    capabilities_map: &HashMap<T, Key, u64>,
-    pnsid_nsid_map: &HashMap<T, Key, u64>,
-    filter_pid: i32,
+    request_map: &mut Stack<V, Request>,
+    stacktrace_map: &StackTraceMap<T>,
+    ksyms: &std::collections::BTreeMap<u64, String>,
 ) -> Result<CapSet, Box<dyn Error>>
 where
     T: Borrow<MapData>,
+    V: BorrowMut<MapData>,
 {
     let mut graph = std::collections::HashMap::new();
     let mut init = CapSet::empty();
     setbpf_effective(true)?;
-    for key in capabilities_map.keys() {
-        let pid = key.inspect_err(|err| {
-            eprintln!("Failed to get pid : {:?}", err.to_string());
-            exit(-1);
-        })?;
-        let pinum_inum = pnsid_nsid_map.get(&pid, 0).unwrap_or(0);
-        let child = pinum_inum as u32;
-        let parent = (pinum_inum >> 32) as u32;
-        let caps = caps_from_u64(if filter_pid == pid {
-            0
-        } else {
-            capabilities_map.get(&pid, 0).unwrap_or(0)
-        });
-        graph
-            .entry(parent)
-            .or_insert_with(Vec::new)
-            .push((child, caps));
-        if child == *nsinode {
-            init = caps;
-        }
+
+    let mut nsid_caps = std::collections::HashMap::new();
+    let set_entry = aggregate_cap_set_entries(request_map, stacktrace_map, ksyms)?;
+    for CapSetEntry {
+        capabilities,
+        parent_ns,
+        ns,
+        ..
+    } in set_entry
+    {
+        let capset = nsid_caps
+            .entry(ns)
+            .or_insert_with(CapSet::empty);
+        *capset |= capabilities;
+        graph.entry(parent_ns).or_insert_with(Vec::new).push(ns);
     }
     setbpf_effective(false)?;
-    let result = init.union(union_all_childs(*nsinode, &graph));
-    Ok(result)
+    init |= union_all_childs(*nsinode, &graph, &nsid_caps);
+    Ok(init)
 }
 
 fn find_from_envpath<P>(exe_name: &P) -> Option<PathBuf>
@@ -256,47 +312,132 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
     (exec_path, exec_args)
 }
 
-fn print_all<T>(
-    capabilities_map: &HashMap<T, Key, u64>,
-    pnsid_nsid_map: &HashMap<T, Key, u64>,
-    uid_gid_map: &HashMap<T, Key, u64>,
-    ppid_map: &HashMap<T, Key, i32>,
-    json: bool,
+fn extract_ns(pinum_inum: u64) -> (u32, u32) {
+    let ns = (pinum_inum & 0xffffffff) as u32;
+    let parent_ns = (pinum_inum >> 32) as u32;
+    (ns, parent_ns)
+}
+
+fn read_exe_link(pid: &Pid) -> String {
+    std::fs::read_link(format!("/proc/{}/exe", pid))
+        .unwrap_or_else(|_| std::path::PathBuf::from(""))
+        .to_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn get_username(uid: &u32) -> String {
+    nix::unistd::User::from_uid(Uid::from_raw(*uid))
+        .map_or(uid.to_string(), |u| u.map_or(uid.to_string(), |u| u.name))
+}
+
+fn get_groupname(gid: &u32) -> String {
+    nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(*gid))
+        .map_or(gid.to_string(), |g| g.map_or(gid.to_string(), |g| g.name))
+}
+
+fn process_data_map<T,V>(
+    data_map: &mut Stack<T, Request>,
+    capabilities_table: &mut Vec<CapabilitiesTable>,
+    stacktrace_map: &StackTraceMap<V>,
+    ksyms: &std::collections::BTreeMap<u64, String>,
 ) -> Result<(), anyhow::Error>
 where
-    T: Borrow<MapData>,
+    T: BorrowMut<MapData>,
+    V: Borrow<MapData>,
 {
-    let mut capabilities_table = Vec::new();
-    for key in capabilities_map.keys() {
-        let pid = key?;
-        let uid_gid = uid_gid_map.get(&pid, 0).unwrap_or(0);
-        let ppid = ppid_map.get(&pid, 0).unwrap_or(0);
-        let pinum_inum = pnsid_nsid_map.get(&pid, 0).unwrap_or(0);
-        let ns = (pinum_inum & 0xffffffff) as u32;
-        let parent_ns = (pinum_inum >> 32) as u32;
-        let exe = std::fs::read_link(format!("/proc/{}/exe", pid))
-            .unwrap_or(std::path::PathBuf::from(""));
-        let name: &str = exe.to_str().unwrap_or("");
-        let capabilities = capabilities_map.get(&pid, 0).unwrap_or(0);
-        let capabilities = caps_from_u64(capabilities);
-        let uid = (uid_gid & 0xffffffff) as u32;
-        //find username from uid
-        let username = nix::unistd::User::from_uid(Uid::from_raw(uid))
-            .map_or(uid.to_string(), |u| u.map_or(uid.to_string(), |u| u.name));
-        let gid = (uid_gid >> 32) as u32;
-        let groupname = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid))
-            .map_or(gid.to_string(), |g| g.map_or(gid.to_string(), |g| g.name));
+    let set_entry = aggregate_cap_set_entries(data_map, stacktrace_map, ksyms)?;
+    for CapSetEntry {
+        pid,
+        ppid,
+        uid,
+        gid,
+        ns,
+        parent_ns,
+        capabilities,
+    } in set_entry
+    {
+        let name = read_exe_link(&pid);
+        let username = get_username(&uid);
+        let groupname = get_groupname(&gid);
         capabilities_table.push(CapabilitiesTable {
-            pid: pid as u32,
-            ppid: ppid as u32,
+            pid,
+            ppid,
             uid: username,
             gid: groupname,
             ns,
             parent_ns,
-            name: String::from(name),
+            name,
             capabilities: capset_to_string(&capabilities),
         });
     }
+    Ok(())
+}
+
+fn aggregate_cap_set_entries<T, V>(
+    data_map: &mut Stack<V, Request>,
+    stacktrace_map: &StackTraceMap<T>,
+    ksyms: &std::collections::BTreeMap<u64, String>,
+) -> Result<HashSet<CapSetEntry>, anyhow::Error>
+where
+    T: Borrow<MapData>,
+    V: BorrowMut<MapData>,
+{
+    let mut set_entry = HashSet::new();
+    while let Ok(Request {
+        pid,
+        ppid,
+        uid_gid,
+        pnsid_nsid,
+        capability,
+        stackid,
+    }) = data_map.pop(0)
+    {
+        assert!(stackid <= i32::MAX as i64); // Inconsistent StackTraceMap key type
+        let (ns, parent_ns) = extract_ns(pnsid_nsid);
+        let uid = uid_gid as u32 as capable_common::Uid;
+        let gid = (uid_gid >> 32) as capable_common::Gid;
+        let mut entry = CapSetEntry::new(pid, ppid, uid, gid, parent_ns, ns);
+        let mut binding = set_entry.take(&entry);
+        let entry = binding.as_mut().unwrap_or(&mut entry);
+        let stack = stacktrace_map.get(&(stackid as u32), 0)?;
+        if capability == Cap::SETUID as u8 && skip_setuid_from_cap_bprm_creds(stack, ksyms)
+        {
+            debug!("skipping SETUID that came from cap_bprm_creds_from_file");
+        } else {
+            entry.add(get_cap(capability).unwrap());
+        }
+
+        //debug!("new entry: {:?}", entry);
+        
+        set_entry.insert(entry.clone());
+    }
+    Ok(set_entry)
+}
+
+fn skip_setuid_from_cap_bprm_creds(stack: aya::maps::stack_trace::StackTrace, ksyms: &std::collections::BTreeMap<u64, String>) -> bool {
+    for frame in stack.frames() {
+        if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
+            if sym == "cap_bprm_creds_from_file" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn print_all<T,V>(
+    data_map: &mut Stack<T, Request>,
+    stacktrace_map: &StackTraceMap<V>,
+    ksyms: &std::collections::BTreeMap<u64, String>,
+    json: bool,
+) -> Result<(), anyhow::Error>
+where
+    T: BorrowMut<MapData>,
+    V: Borrow<MapData>,
+{
+    let mut capabilities_table = Vec::new();
+    process_data_map(data_map, &mut capabilities_table, stacktrace_map, ksyms)?;
     if json {
         println!("{}", serde_json::to_string(&capabilities_table)?);
     } else {
@@ -671,14 +812,9 @@ async fn main() -> Result<(), anyhow::Error> {
     setbpf_effective(false)?;
     setadmin_effective(false)?;
     debug!("program {} loaded and attached", "capable");
-    let capabilities_map: HashMap<_, Key, u64> =
-        HashMap::try_from(bpf.borrow().map("CAPABILITIES_MAP").unwrap())?;
-    let pnsid_nsid_map: HashMap<_, Key, u64> =
-        HashMap::try_from(bpf.borrow().map("PNSID_NSID_MAP").unwrap())?;
-    let uid_gid_map: HashMap<_, Key, u64> =
-        HashMap::try_from(bpf.borrow().map("UID_GID_MAP").unwrap())?;
-    let ppid_map: HashMap<_, Key, i32> = HashMap::try_from(bpf.map("PPID_MAP").unwrap())?;
-
+    let mut requests_map: Stack<_, Request> = Stack::try_from(bpf.take_map("ENTRY_STACK").unwrap())?;
+    let stack_traces = StackTraceMap::try_from(bpf.borrow().map("STACKTRACE_MAP").unwrap())?;
+    let ksyms: std::collections::BTreeMap<u64, String> = kernel_symbols()?;
     setbpf_effective(false)?;
     setadmin_effective(false)?;
     let mut cli_args = getopt(std::env::args())?;
@@ -686,14 +822,8 @@ async fn main() -> Result<(), anyhow::Error> {
     {
         if cli_args.daemon || cli_args.command.is_empty() {
             println!("Waiting for Ctrl-C...");
-            signal::ctrl_c().await?;
-            print_all(
-                &capabilities_map,
-                &pnsid_nsid_map,
-                &uid_gid_map,
-                &ppid_map,
-                cli_args.json,
-            )?;
+            signal::ctrl_c().await.expect("failed to wait for ctrl-c");
+            print_all(&mut requests_map, &stack_traces, &ksyms, cli_args.json)?;
         } else {
             let nsinode: Rc<RefCell<u32>> = Rc::new(0.into());
             let mut pid = 0;
@@ -705,9 +835,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
             let capset = program_capabilities(
                 &nsinode.as_ref().borrow(),
-                &capabilities_map,
-                &pnsid_nsid_map,
-                pid,
+                &mut requests_map,
+                &stack_traces,
+                &ksyms,
             )
             .expect("failed to print capabilities");
 
@@ -739,6 +869,11 @@ async fn main() -> Result<(), anyhow::Error> {
                         .collect::<Vec<String>>()
                         .join("\n")
                 );
+            }
+            if !exit.success() {
+                //set the exit code to the command exit code
+                //copy the exit message
+                std::process::exit(exit.code().unwrap_or(-1));
             }
         }
     }

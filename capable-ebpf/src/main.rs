@@ -8,28 +8,28 @@
 mod vmlinux;
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_task, bpf_get_current_uid_gid, bpf_probe_read_kernel}, macros::{kprobe, map}, maps::HashMap, programs::ProbeContext
+    helpers::{bpf_get_current_task, bpf_get_current_uid_gid, bpf_probe_read_kernel}, macros::{kprobe, map}, maps::stack_trace::StackTrace, programs::ProbeContext
 };
+use aya_ebpf::maps::Stack;
 use vmlinux::{ns_common, nsproxy, pid_namespace, task_struct};
+use capable_common::Request;
 
 #[kprobe]
 pub fn capable(ctx: ProbeContext) -> u32 {
     try_capable(&ctx).unwrap_or_else(|ret| ret as u32)
 }
 
-type Key = i32;
+
 pub type TaskStructPtr = *mut task_struct;
-pub const MAX_PID: u32 = 4 * 1024 * 1024;
+pub const MAX_PID: u32 = 2 * 1024 * 1024;
 pub const EPERM : i32 = 1;
 
+
 #[map]
-static mut CAPABILITIES_MAP: HashMap<Key, u64> = HashMap::with_max_entries(MAX_PID, 0);
+static mut ENTRY_STACK: Stack<Request> = Stack::with_max_entries(MAX_PID, 0);
+
 #[map]
-static mut UID_GID_MAP: HashMap<Key, u64> = HashMap::with_max_entries(MAX_PID, 0);
-#[map]
-static mut PPID_MAP: HashMap<Key, i32> = HashMap::with_max_entries(MAX_PID, 0);
-#[map]
-static mut PNSID_NSID_MAP: HashMap<Key, u64> = HashMap::with_max_entries(MAX_PID, 0);
+static mut STACKTRACE_MAP: StackTrace = StackTrace::with_max_entries(MAX_PID, 0);
 
 pub fn try_capable(ctx: &ProbeContext) -> Result<u32, i64> {
     unsafe {
@@ -37,24 +37,23 @@ pub fn try_capable(ctx: &ProbeContext) -> Result<u32, i64> {
         let task = bpf_probe_read_kernel(&task)?;
         let ppid: i32 = get_ppid(task)?;
         let pid: i32 = bpf_probe_read_kernel(&(*task).pid)? as i32;
-        let cap: u64 = (1 << ctx.arg::<u8>(2).unwrap()) as u64;
-        let uid: u64 = bpf_get_current_uid_gid();
-        let zero = 0;
-        let capval: u64 = *CAPABILITIES_MAP.get(&pid).unwrap_or(&zero);
-        let pinum_inum: u64 = Into::<u64>::into(get_parent_ns_inode(task)?) << 32
-            | Into::<u64>::into(get_ns_inode(task)?);
-        UID_GID_MAP
-            .insert(&pid, &uid, 0)
-            .expect("failed to insert uid");
-        PNSID_NSID_MAP
-            .insert(&pid, &pinum_inum, 0)
-            .expect("failed to insert pnsid");
-        PPID_MAP
-            .insert(&pid, &ppid, 0)
-            .expect("failed to insert ppid");
-        CAPABILITIES_MAP
-            .insert(&pid, &(capval | cap), 0)
-            .expect("failed to insert cap");
+        let capability: u8 = ctx.arg::<u8>(2).unwrap();
+        let capabilities: u64 = (1 << capability) as u64;
+        let uid_gid: u64 = bpf_get_current_uid_gid();
+        let nsid: u32 = get_ns_inode(task)?;
+        let pnsid_nsid: u64 = Into::<u64>::into(get_parent_ns_inode(task)?) << 32
+            | Into::<u64>::into(nsid);
+        let stackid = STACKTRACE_MAP.get_stackid(ctx, 0)?;
+        let request = Request {
+            pid,
+            uid_gid,
+            ppid,
+            pnsid_nsid,
+            capability,
+            stackid,
+        };
+        ENTRY_STACK.push(&request, 0).expect("Failed to insert request");
+
     }
     Ok(0)
 }

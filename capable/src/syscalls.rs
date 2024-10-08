@@ -271,6 +271,7 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
             // retrieve POSIX access rights
             let _ = dac_read_search_effective(true);
             match fs::symlink_metadata(&path) {
+                // TODO: Add folder permission checks
                 Ok(metadata) => {
                     let mode =
                         Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().unwrap());
