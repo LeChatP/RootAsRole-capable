@@ -401,11 +401,20 @@ where
         let mut binding = set_entry.take(&entry);
         let entry = binding.as_mut().unwrap_or(&mut entry);
         let stack = stacktrace_map.get(&(stackid as u32), 0)?;
-        if capability == Cap::SETUID as u8 && skip_setuid_from_cap_bprm_creds(stack, ksyms)
+        if capability == Cap::SETUID as u8 && skip_priv_sym(&stack, ksyms, "cap_bprm_creds_from_file")
         {
             debug!("skipping SETUID that came from cap_bprm_creds_from_file");
+        } else if (capability == Cap::DAC_OVERRIDE as u8 || capability == Cap::DAC_READ_SEARCH as u8) && skip_priv_sym(&stack, ksyms, "may_open") {
+            debug!("skipping DAC_OVERRIDE that came from open");
         } else {
             entry.add(get_cap(capability).unwrap());
+            // debug the stack trace
+            debug!("pid: {}, ppid: {}, uid: {}, gid: {}, ns: {}, parent_ns: {}, capability: {:?}\nStacktrace :", pid, ppid, uid, gid, ns, parent_ns, get_cap(capability).unwrap());
+            for frame in stack.frames() {
+                if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
+                    debug!("{}()", sym);
+                }
+            }
         }
 
         //debug!("new entry: {:?}", entry);
@@ -415,10 +424,10 @@ where
     Ok(set_entry)
 }
 
-fn skip_setuid_from_cap_bprm_creds(stack: aya::maps::stack_trace::StackTrace, ksyms: &std::collections::BTreeMap<u64, String>) -> bool {
+fn skip_priv_sym(stack: &aya::maps::stack_trace::StackTrace, ksyms: &std::collections::BTreeMap<u64, String>, symbol: &str) -> bool {
     for frame in stack.frames() {
         if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
-            if sym == "cap_bprm_creds_from_file" {
+            if sym == symbol {
                 return true;
             }
         }
@@ -845,6 +854,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?
                     .iter()
                     .map(|syscall| syscalls::syscall_to_entry(syscall))
+                    .flatten()
                     .flatten()
                     .collect();
             let mut map = std::collections::HashMap::new();
