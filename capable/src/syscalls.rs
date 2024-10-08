@@ -218,12 +218,48 @@ pub const CALLS: [(&str, Pos, Access); 130] = [
     ("utimes", Pos::One, Access::W),
 ];
 
-pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
+/**
+ * Check entire path for access rights
+ */
+fn check_directories_access<P:AsRef<Path> + Clone>(initial_path: P, syscall: &Syscall, create_or_delete: bool) -> Vec<SyscallAccessEntry> {
+    // for each directory in the path
+    let mut result = Vec::new();
+    let mut parent = initial_path.as_ref();
+    while parent.parent().is_some() {
+        parent = parent.parent().unwrap();
+        let metadata = match fs::symlink_metadata(&parent) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                warn!("Cannot retrieve metadata for path: {}", parent.display());
+                continue;
+            }
+        };
+        let mode = Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().unwrap());
+        let access = Access::X | if create_or_delete && initial_path.as_ref().parent() == Some(parent) {
+            Access::W
+        } else {
+            Access::empty()
+        };
+        if mode.intersection(access).eq(&access) {
+            debug!("{} has {} rights for others, so ignoring", parent.display(), mode);
+            continue;
+        }
+        result.push(SyscallAccessEntry {
+            access,
+            syscall: syscall.syscall.clone(),
+            path: parent.display().to_string(),
+        });
+    }
+    result
+}
+
+pub fn syscall_to_entry(syscall: &Syscall) -> Option<Vec<SyscallAccessEntry>> {
     for (name, pos, access) in CALLS.iter() {
         if pos.is_empty() {
             continue;
         }
         if name == &syscall.syscall {
+            let mut result = Vec::new();
             let path = syscall
                 .args
                 .clone()
@@ -231,6 +267,7 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
                 .nth((*pos).clone().into())
                 .unwrap()
                 .to_string();
+            let mut create_or_delete = false;
             let mut access = access.clone();
             match *name {
                 "open" | "openat" | "openat2" => {
@@ -243,21 +280,30 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
                         access |= Access::R;
                         debug!("Found O_RDONLY");
                     }
-                    if flags.contains("O_WRONLY") | flags.contains("O_CREAT") {
+                    if flags.contains("O_CREAT") {
                         access |= Access::W;
-                        debug!("Found O_WRONLY | O_CREAT");
+                        create_or_delete = true;
+                        debug!("Found O_CREAT");
+                    }
+                    if flags.contains("O_WRONLY") {
+                        access |= Access::W;
+                        debug!("Found O_WRONLY");
                     }
                     if flags.contains("O_RDWR") {
                         access |= Access::RW;
                         debug!("Found O_RDWR");
                     }
-                }
+                },
+                "mkdir" | "mkdirat" | "mknod" | "mknodat" | "symlink" | "symlinkat" | "unlink" | "unlinkat" => {
+                    create_or_delete = true;
+                },
                 _ => {}
             }
+            result.extend(check_directories_access(&path, syscall, create_or_delete));
             if access.is_empty() {
                 continue;
             }
-            debug!("{} is requesting {} at {}", name, access, path);
+            debug!("{} is requesting {} at {}", name, access, &path);
             if syscall
                 .return_code
                 .constant
@@ -287,12 +333,16 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<SyscallAccessEntry> {
                 }
             }
             let _ = dac_read_search_effective(false);
-
-            return Some(SyscallAccessEntry {
+            result.push(SyscallAccessEntry {
                 path,
                 access,
                 syscall: syscall.syscall.clone(),
             });
+            if result.is_empty() {
+                return None;
+            } else {
+                return Some(result);
+            }
         }
     }
     None
