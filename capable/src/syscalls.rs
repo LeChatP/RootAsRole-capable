@@ -1,13 +1,13 @@
 use std::{
     fs,
     os::linux::fs::MetadataExt,
-    path::{Display, Path},
+    path::Path,
 };
 
 use bitflags::bitflags;
 use log::warn;
 use serde::Serialize;
-use tracing::{debug, info_span};
+use tracing::debug;
 
 use crate::{dac_read_search_effective, strace::Syscall};
 
@@ -140,7 +140,7 @@ pub const CALLS: [(&str, Pos, Access); 130] = [
     ("mount_setattr", Pos::empty(), Access::empty()), // CAP_SYS_ADMIN
     ("move_mount", Pos::empty(), Access::empty()), // CAP_SYS_ADMIN
     ("name_to_handle_at", Pos::Two, Access::R),
-    ("newfstatat", Pos::empty(), Access::empty()), // None
+    ("newfstatat", Pos::Two, Access::R),
     ("oldfstat", Pos::empty(), Access::empty()),
     ("oldlstat", Pos::empty(), Access::empty()),
     ("oldstat", Pos::empty(), Access::empty()),
@@ -258,7 +258,7 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<Vec<SyscallAccessEntry>> {
         if pos.is_empty() {
             continue;
         }
-        if name == &syscall.syscall {
+        if *name == syscall.syscall {
             let mut result = Vec::new();
             let path = syscall
                 .args

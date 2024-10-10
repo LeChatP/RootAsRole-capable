@@ -38,7 +38,6 @@ pub fn try_capable(ctx: &ProbeContext) -> Result<u32, i64> {
         let ppid: i32 = get_ppid(task)?;
         let pid: i32 = bpf_probe_read_kernel(&(*task).pid)? as i32;
         let capability: u8 = ctx.arg::<u8>(2).unwrap();
-        let capabilities: u64 = (1 << capability) as u64;
         let uid_gid: u64 = bpf_get_current_uid_gid();
         let nsid: u32 = get_ns_inode(task)?;
         let pnsid_nsid: u64 = Into::<u64>::into(get_parent_ns_inode(task)?) << 32

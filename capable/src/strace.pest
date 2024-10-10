@@ -1,7 +1,7 @@
 file= _{ SOI ~ (syscall_call)+ ~ exit ~ EOI }
 syscall_call = { syscall ~ "(" ~ arguments+ ~ comment? ~ ")" ~ "=" ~ return_code ~ NEWLINE? }
 arguments = _{ argument ~ ("," ~ arguments)? }
-syscall = { CASED_LETTER+ }
+syscall = { (CASED_LETTER | ASCII_DIGIT)+ }
 argument = _{ array | string_quote | constant | structure }
 string_list = _{ string_quote ~ ("," ~ string_list)? }
 string_quote = _{"\"" ~ string ~ "\""}

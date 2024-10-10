@@ -19,8 +19,7 @@ use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
 use log::{debug, warn};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{getpid, Uid};
-use serde::{de, Deserialize, Serialize};
-use tracing_subscriber::field::debug;
+use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -204,16 +203,6 @@ fn get_cap(val: u8) -> Option<Cap> {
         40 => Some(Cap::CHECKPOINT_RESTORE),
         _ => None,
     }
-}
-
-fn caps_from_u64(caps: u64) -> CapSet {
-    let mut capset = CapSet::empty();
-    for i in 0..64 {
-        if caps & (1 << i) != 0 {
-            capset.add(get_cap(i).unwrap());
-        }
-    }
-    capset
 }
 
 fn union_all_childs(
