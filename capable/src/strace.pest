@@ -5,13 +5,13 @@ syscall = { (CASED_LETTER | ASCII_DIGIT)+ }
 argument = _{ array | string_quote | constant | structure }
 string_list = _{ string_quote ~ ("," ~ string_list)? }
 string_quote = _{"\"" ~ string ~ "\""}
-string = { (!"\"" ~ ANY)* } 
+string = { (!(!"\\" ~ "\"") ~ ANY)* } 
 array = {"[" ~ (!"]" ~ string_list) ~ "]"}
 constant = { ('a'..'z'|'A'..'Z'|"_"|'0'..'9'|"|"|"-")+ }
 comment = { "/*"  ~ (!"*/" ~ ANY)+ ~ "*/" }
 return_code = { return_value ~ constant? ~ message? }
 return_value = { "-"? ~ ASCII_DIGIT+ }
-message = { "(" ~ (!")" ~ ANY)+ ~ ")" }
+message = { "(" ~ (!(!"\\" ~ ")") ~ ANY)+ ~ ")" }
 structure = { "{" ~ dict ~ "}" }
 dict = _{ key_value ~ ("," ~ (dict | "."+))? }
 key_value = _{key ~ "=" ~ value }
