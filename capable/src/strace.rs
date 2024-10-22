@@ -71,7 +71,22 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
     };
     for pair in pair.into_inner() {
         match pair.as_rule() {
-            Rule::syscall => syscall.syscall = pair.as_str().to_string(),
+            Rule::syscall => {
+                if !syscall.syscall.is_empty() {
+                    syscalls.push(syscall);
+                    syscall = Syscall {
+                        syscall: String::new(),
+                        args: Vec::new(),
+                        return_code: ReturnCode {
+                            code: 0,
+                            constant: None,
+                            message: None,
+                        },
+                    };
+                }
+                syscall.syscall = pair.as_str().to_string();
+                warn!("Syscall: {:?}", syscall.syscall);
+            },
             Rule::array => {
                 syscall.args.push(Parameter::Array(
                     pair.into_inner().map(|x| x.as_str().to_string()).collect(),
@@ -126,7 +141,10 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
                         }
                     }
                 }
-            }
+            },
+            Rule::signal => {
+                warn!("Signal: {:?}", pair.as_str());
+            },
             _ => {
                 warn!("Unexpected rule: {:?}", pair.as_rule());
             }

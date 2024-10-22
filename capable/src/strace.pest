@@ -1,10 +1,10 @@
 file= _{ SOI ~ (syscall_call)+ ~ exit ~ EOI }
-syscall_call = { syscall ~ "(" ~ arguments+ ~ comment? ~ ")" ~ "=" ~ return_code ~ NEWLINE? }
+syscall_call = { syscall ~ "(" ~ arguments+ ~ comment? ~ ")" ~ "=" ~ return_code ~ NEWLINE? | signal ~ NEWLINE? }
 arguments = _{ argument ~ ("," ~ arguments)? }
 syscall = { (CASED_LETTER | ASCII_DIGIT)+ }
-argument = _{ array | string_quote | constant | structure }
-string_list = _{ string_quote ~ ("," ~ string_list)? }
-string_quote = _{"\"" ~ string ~ "\""}
+argument = _{ array | string_quote | structure | constant }
+string_list = _{ (string_quote|constant) ~ ("," ~ string_list)? }
+string_quote = _{"\"" ~ string ~ "\"" ~ "."*}
 string = { (( "\\\"" | !"\"" ) ~ ANY)+ } 
 array = {"[" ~ (!"]" ~ string_list) ~ "]"}
 constant = { ('a'..'z'|'A'..'Z'|"_"|'0'..'9'|"|"|"-")+ }
@@ -16,8 +16,12 @@ structure = { "{" ~ dict ~ "}" }
 dict = _{ key_value ~ ("," ~ (dict | "."+))? }
 key_value = _{key ~ "=" ~ value }
 key = @{constant}
-value = @{constant}
-exit = {"+"+ ~ "exited with " ~ return_code ~ "+"+ ~ ANY}
+value = {constant ~ parameters? | structure | array}
+parameters = { "(" ~ arguments ~ ")" }
+exit = {"+"+ ~ "exited with " ~ return_code ~ "+"+ ~ EOF | "+"+ ~ "killed by " ~ signal_name ~ "+"+ ~ EOF}
+signal = { "-"+ ~ signal_name ~ structure ~ "-"+ }
+signal_name = { "SIG" ~ (CASED_LETTER | ASCII_DIGIT)+ }
+EOF = _{ NEWLINE* ~ EOI }
 
 NOT_ESCAPE_QUOTE = _{ !"\\" ~ ("\""|"'") }
 WHITESPACE       = _{ ((!NOT_ESCAPE_QUOTE) ~ SEPARATOR)+}

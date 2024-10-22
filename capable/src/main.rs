@@ -220,7 +220,7 @@ fn union_all_childs(
     result
 }
 
-fn program_capabilities<T,V>(
+fn program_capabilities<T, V>(
     nsinode: &u32,
     request_map: &mut Stack<V, Request>,
     stacktrace_map: &StackTraceMap<T>,
@@ -243,9 +243,7 @@ where
         ..
     } in set_entry
     {
-        let capset = nsid_caps
-            .entry(ns)
-            .or_insert_with(CapSet::empty);
+        let capset = nsid_caps.entry(ns).or_insert_with(CapSet::empty);
         *capset |= capabilities;
         graph.entry(parent_ns).or_insert_with(Vec::new).push(ns);
     }
@@ -289,7 +287,7 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
         exec_path = strace;
         exec_args = vec![
             "-e".to_string(),
-            "file".to_string(),
+            "ptrace,file".to_string(),
             "-o".to_string(),
             format!("/tmp/capable_strace_{}.log", getpid()),
         ];
@@ -325,7 +323,7 @@ fn get_groupname(gid: &u32) -> String {
         .map_or(gid.to_string(), |g| g.map_or(gid.to_string(), |g| g.name))
 }
 
-fn process_data_map<T,V>(
+fn process_data_map<T, V>(
     data_map: &mut Stack<T, Request>,
     capabilities_table: &mut Vec<CapabilitiesTable>,
     stacktrace_map: &StackTraceMap<V>,
@@ -390,11 +388,27 @@ where
         let mut binding = set_entry.take(&entry);
         let entry = binding.as_mut().unwrap_or(&mut entry);
         let stack = stacktrace_map.get(&(stackid as u32), 0)?;
-        if capability == Cap::SETUID as u8 && skip_priv_sym(&stack, ksyms, "cap_bprm_creds_from_file")
+        if capability == Cap::SETUID as u8
+            && skip_priv_sym(&stack, ksyms, "cap_bprm_creds_from_file")
         {
             debug!("skipping SETUID that came from cap_bprm_creds_from_file");
-        } else if (capability == Cap::DAC_OVERRIDE as u8 || capability == Cap::DAC_READ_SEARCH as u8) && skip_priv_sym(&stack, ksyms, "may_open") {
+        } else if capability == Cap::DAC_OVERRIDE as u8
+            || capability == Cap::DAC_READ_SEARCH as u8
+            && skip_priv_sym(&stack, ksyms, "may_open")
+        {
             debug!("skipping DAC_OVERRIDE that came from open");
+        } else if capability == Cap::SYS_PTRACE as u8
+            && (skip_priv_sym(&stack, ksyms, "do_sys_openat2"))
+        {
+            debug!(
+                "skipping SYS_PTRACE that came from cap_ptrace_access_check or ptrace_may_access : \"\"\""
+            );
+            for frame in stack.frames() {
+                if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
+                    debug!("{}()", sym);
+                }
+            }
+            debug!("\"\"\"");
         } else {
             entry.add(get_cap(capability).unwrap());
             // debug the stack trace
@@ -407,13 +421,17 @@ where
         }
 
         //debug!("new entry: {:?}", entry);
-        
+
         set_entry.insert(entry.clone());
     }
     Ok(set_entry)
 }
 
-fn skip_priv_sym(stack: &aya::maps::stack_trace::StackTrace, ksyms: &std::collections::BTreeMap<u64, String>, symbol: &str) -> bool {
+fn skip_priv_sym(
+    stack: &aya::maps::stack_trace::StackTrace,
+    ksyms: &std::collections::BTreeMap<u64, String>,
+    symbol: &str,
+) -> bool {
     for frame in stack.frames() {
         if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
             if sym == symbol {
@@ -424,7 +442,7 @@ fn skip_priv_sym(stack: &aya::maps::stack_trace::StackTrace, ksyms: &std::collec
     false
 }
 
-fn print_all<T,V>(
+fn print_all<T, V>(
     data_map: &mut Stack<T, Request>,
     stacktrace_map: &StackTraceMap<V>,
     ksyms: &std::collections::BTreeMap<u64, String>,
@@ -810,7 +828,8 @@ async fn main() -> Result<(), anyhow::Error> {
     setbpf_effective(false)?;
     setadmin_effective(false)?;
     debug!("program {} loaded and attached", "capable");
-    let mut requests_map: Stack<_, Request> = Stack::try_from(bpf.take_map("ENTRY_STACK").unwrap())?;
+    let mut requests_map: Stack<_, Request> =
+        Stack::try_from(bpf.take_map("ENTRY_STACK").unwrap())?;
     let stack_traces = StackTraceMap::try_from(bpf.borrow().map("STACKTRACE_MAP").unwrap())?;
     let ksyms: std::collections::BTreeMap<u64, String> = kernel_symbols()?;
     setbpf_effective(false)?;
@@ -831,7 +850,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 eprintln!("Please check the command and try again with requested capabilities as you want to reach");
             }
 
-            let capset = program_capabilities(
+            let mut capset = program_capabilities(
                 &nsinode.as_ref().borrow(),
                 &mut requests_map,
                 &stack_traces,
@@ -842,7 +861,12 @@ async fn main() -> Result<(), anyhow::Error> {
             let access: Vec<SyscallAccessEntry> =
                 read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?
                     .iter()
-                    .map(|syscall| syscalls::syscall_to_entry(syscall))
+                    .map(|syscall| {
+                        if syscall.syscall.trim() == "ptrace" {
+                            capset.add(Cap::SYS_PTRACE);
+                        }
+                        syscalls::syscall_to_entry(syscall)
+                    })
                     .flatten()
                     .flatten()
                     .collect();
