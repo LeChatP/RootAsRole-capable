@@ -145,6 +145,9 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
             Rule::signal => {
                 warn!("Signal: {:?}", pair.as_str());
             },
+            Rule::pid => {
+                warn!("namespaced PID: {:?}", pair.as_str());
+            },
             _ => {
                 warn!("Unexpected rule: {:?}", pair.as_rule());
             }

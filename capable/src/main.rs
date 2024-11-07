@@ -3,23 +3,29 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::CString;
-use std::fs::{canonicalize, metadata};
+use std::fs::{canonicalize, metadata, File};
 use std::hash::Hash;
+use std::io::Write;
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::exit;
+use std::process::{exit, ExitCode};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aya::maps::{MapData, Stack, StackTraceMap};
 use aya::programs::KProbe;
 use aya::util::{kernel_symbols, KernelVersion};
 use aya::{include_bytes_aligned, Ebpf};
 use aya_log::EbpfLogger;
+use bus::{run_dbus_monitor, Memory};
 use capable_common::{Nsid, Pid, Request};
 use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
 use log::{debug, warn};
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getpid, Uid};
+use nix::sys::signal::kill;
+use nix::sys::wait::{self, waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{fork, getpid, ForkResult, Uid};
 use serde::{Deserialize, Serialize};
+use signal_hook::consts::TERM_SIGNALS;
+use signal_hook::flag;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,16 +35,15 @@ use syscalls::SyscallAccessEntry;
 use tabled::settings::object::Columns;
 use unshare::ExitStatus;
 
-use tabled::settings::{Modify, Style, Width};
+use tabled::settings::{format, Modify, Style, Width};
 use tabled::{Table, Tabled};
-use tokio::runtime::Runtime;
-use tokio::signal;
 use tracing::Level;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod strace;
 mod syscalls;
 mod version;
+mod bus;
 
 struct Cli {
     /// Specify a delay before killing the process
@@ -286,6 +291,7 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
     if let Some(strace) = find_strace() {
         exec_path = strace;
         exec_args = vec![
+            "-fF".to_string(),
             "-e".to_string(),
             "ptrace,file".to_string(),
             "-o".to_string(),
@@ -388,31 +394,15 @@ where
         let mut binding = set_entry.take(&entry);
         let entry = binding.as_mut().unwrap_or(&mut entry);
         let stack = stacktrace_map.get(&(stackid as u32), 0)?;
-        if capability == Cap::SETUID as u8
-            && skip_priv_sym(&stack, ksyms, "cap_bprm_creds_from_file")
+        if !((capability == Cap::SETUID as u8
+            && skip_priv_sym(&stack, ksyms, "cap_bprm_creds_from_file"))
+            || capability == Cap::DAC_OVERRIDE as u8
+            || (capability == Cap::DAC_READ_SEARCH as u8
+            && skip_priv_sym(&stack, ksyms, "may_open"))
+            || capability == Cap::SYS_PTRACE as u8)
         {
-            debug!("skipping SETUID that came from cap_bprm_creds_from_file");
-        } else if capability == Cap::DAC_OVERRIDE as u8
-            || capability == Cap::DAC_READ_SEARCH as u8
-            && skip_priv_sym(&stack, ksyms, "may_open")
-        {
-            debug!("skipping DAC_OVERRIDE that came from open");
-        } else if capability == Cap::SYS_PTRACE as u8
-            && (skip_priv_sym(&stack, ksyms, "do_sys_openat2"))
-        {
-            debug!(
-                "skipping SYS_PTRACE that came from cap_ptrace_access_check or ptrace_may_access : \"\"\""
-            );
-            for frame in stack.frames() {
-                if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
-                    debug!("{}()", sym);
-                }
-            }
-            debug!("\"\"\"");
-        } else {
             entry.add(get_cap(capability).unwrap());
             // debug the stack trace
-            debug!("pid: {}, ppid: {}, uid: {}, gid: {}, ns: {}, parent_ns: {}, capability: {:?}\nStacktrace :", pid, ppid, uid, gid, ns, parent_ns, get_cap(capability).unwrap());
             for frame in stack.frames() {
                 if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
                     debug!("{}()", sym);
@@ -661,11 +651,15 @@ fn run_command(
     let cloned = child.clone();
     *pid = child.try_lock().unwrap().id() as i32;
     let pid_cloned = pid.clone();
+    let term = Arc::new(AtomicBool::new(false));
+    for sig in TERM_SIGNALS {
+        flag::register(*sig, Arc::clone(&term))?;
+    }
 
     thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(signal::ctrl_c())
-            .expect("failed to wait for ctrl-c");
+        while !term.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(400));
+        }
         let nixpid = nix::unistd::Pid::from_raw(pid_cloned);
         nix::sys::signal::kill(nixpid, nix::sys::signal::Signal::SIGINT)
             .expect("failed to send SIGINT");
@@ -757,10 +751,12 @@ pub fn subsribe(tool: &str) {
 struct ProgramResult {
     capabilities: Vec<String>,
     files: std::collections::HashMap<String, syscalls::Access>,
+    dbus: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+const DBUS_JSON_PATH: &str = "/tmp/capable_dbus.json";
+
+fn main() -> Result<(), anyhow::Error> {
     subsribe("capable");
     //env_logger::init();
     //ambient::clear().expect("Failed to clear ambiant caps");
@@ -835,69 +831,122 @@ async fn main() -> Result<(), anyhow::Error> {
     setbpf_effective(false)?;
     setadmin_effective(false)?;
     let mut cli_args = getopt(std::env::args())?;
-
+    
     {
         if cli_args.daemon || cli_args.command.is_empty() {
             println!("Waiting for Ctrl-C...");
-            signal::ctrl_c().await.expect("failed to wait for ctrl-c");
+            let term = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
+            while !term.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(400));
+            }
             print_all(&mut requests_map, &stack_traces, &ksyms, cli_args.json)?;
         } else {
             let nsinode: Rc<RefCell<u32>> = Rc::new(0.into());
             let mut pid = 0;
-            let exit = run_command(&mut cli_args, nsinode.clone(), &mut pid)?;
-            if !exit.success() && !cli_args.json {
-                eprintln!("Command failed with exit status: {}", exit);
-                eprintln!("Please check the command and try again with requested capabilities as you want to reach");
+            //we need to fork
+
+            let forked = unsafe { fork().expect("Failed to fork") };
+            match forked {
+                ForkResult::Child => {
+                    let term_now = Arc::new(Memory::default());
+                    for sig in TERM_SIGNALS {
+                        // When terminated by a second term signal, exit with exit code 1.
+                        // This will do nothing the first time (because term_now is false).
+                        flag::register_conditional_shutdown(*sig, 1, Arc::clone(&term_now.cancel))?;
+                        // But this will "arm" the above for the second time, by setting it to true.
+                        // The order of registering these is important, if you put this one first, it will
+                        // first arm and then terminate ‒ all in the first round.
+                        flag::register(*sig, Arc::clone(&term_now.cancel))?;
+                    }
+                    nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).expect("Failed to setuid");
+                    let res= run_dbus_monitor(term_now.clone());
+                    //debug!("MEMORY : {:?}", term_now);
+                    let mut file = File::create(DBUS_JSON_PATH)?;
+                    write!(file,"{}",&serde_json::to_string(&(res?))?)?;
+                    file.flush()?;
+                    exit(0);
+                }
+                // let's setuid(root)
+                ForkResult::Parent { child } => {
+                    let exit = run_command(&mut cli_args, nsinode.clone(), &mut pid)?;
+                    kill(child, nix::sys::signal::Signal::SIGINT)
+                        .expect("failed to send SIGINT to child");
+                    waitpid(child, Some(WaitPidFlag::empty()))?;
+                    if !exit.success() && !cli_args.json {
+                        eprintln!("Command failed with exit status: {}", exit);
+                        eprintln!("Please check the command and try again with requested capabilities as you want to reach");
+                    }
+
+                    let mut capset = program_capabilities(
+                        &nsinode.as_ref().borrow(),
+                        &mut requests_map,
+                        &stack_traces,
+                        &ksyms,
+                    )
+                    .expect("failed to print capabilities");
+
+                    let access: Vec<SyscallAccessEntry> =
+                        read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?
+                            .iter()
+                            .map(|syscall| {
+                                if syscall.syscall.trim() == "ptrace" {
+                                    capset.add(Cap::SYS_PTRACE);
+                                }
+                                syscalls::syscall_to_entry(syscall)
+                            })
+                            .flatten()
+                            .flatten()
+                            .collect();
+                    let mut map = std::collections::HashMap::new();
+                    for entry in access {
+                        let key = entry.path.clone();
+                        let value = entry.access;
+                        *map.entry(key).or_insert(value) |= entry.access;
+                    }
+
+                    // dbus filtering
+                    let method_list = bus::get_dbus_methods(DBUS_JSON_PATH, nsinode.clone())?;
+
+                    if cli_args.json {
+                        let result = ProgramResult {
+                            capabilities: capset_to_vec(&capset),
+                            files: map,
+                            dbus: method_list,
+                        };
+                        println!("{}", serde_json::to_string(&result)?);
+                    } else {
+                        println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
+                        capset_to_string(&capset));
+                        println!(
+                            "Here's all DAC requests intercepted for this program :\n{}",
+                            map.iter()
+                                .map(|(k, v)| format!("{} : {}", k, v))
+                                .collect::<Vec<String>>()
+                                .join("\n")
+                        );
+                        println!(
+                            "Here's all Dbus messages intercepted for this program :\n{}",
+                            method_list.join(", ")
+                        );
+                    }
+                    if !exit.success() {
+                        //set the exit code to the command exit code
+                        //copy the exit message
+                        std::process::exit(exit.code().unwrap_or(-1));
+                    }
+                }
             }
 
-            let mut capset = program_capabilities(
-                &nsinode.as_ref().borrow(),
-                &mut requests_map,
-                &stack_traces,
-                &ksyms,
-            )
-            .expect("failed to print capabilities");
-
-            let access: Vec<SyscallAccessEntry> =
-                read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?
-                    .iter()
-                    .map(|syscall| {
-                        if syscall.syscall.trim() == "ptrace" {
-                            capset.add(Cap::SYS_PTRACE);
-                        }
-                        syscalls::syscall_to_entry(syscall)
-                    })
-                    .flatten()
-                    .flatten()
-                    .collect();
-            let mut map = std::collections::HashMap::new();
-            for entry in access {
-                let key = entry.path.clone();
-                let value = entry.access;
-                *map.entry(key).or_insert(value) |= entry.access;
-            }
-            if cli_args.json {
-                let result = ProgramResult {
-                    capabilities: capset_to_vec(&capset),
-                    files: map,
-                };
-                println!("{}", serde_json::to_string(&result)?);
-            } else {
-                println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
-                capset_to_string(&capset));
-                println!(
-                    "Here's all DAC requests intercepted for this program :\n{}",
-                    map.iter()
-                        .map(|(k, v)| format!("{} : {}", k, v))
-                        .collect::<Vec<String>>()
-                        .join("\n")
-                );
-            }
-            if !exit.success() {
-                //set the exit code to the command exit code
-                //copy the exit message
-                std::process::exit(exit.code().unwrap_or(-1));
-            }
+            //let monitor_task = {
+            //    tokio::spawn( async move {
+            //        if let Err(e) = run_dbus_monitor(token).await {
+            //            eprintln!("Error in dbus monitor: {}", e);
+            //        }
+            //    })
+            //};
+            
+            
         }
     }
     Ok(())
