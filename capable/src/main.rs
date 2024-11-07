@@ -291,7 +291,7 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
     if let Some(strace) = find_strace() {
         exec_path = strace;
         exec_args = vec![
-            "-fF".to_string(),
+            "-f".to_string(),
             "-e".to_string(),
             "ptrace,file".to_string(),
             "-o".to_string(),
@@ -914,7 +914,7 @@ fn main() -> Result<(), anyhow::Error> {
                             files: map,
                             dbus: method_list,
                         };
-                        println!("{}", serde_json::to_string(&result)?);
+                        println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
                         println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
                         capset_to_string(&capset));
