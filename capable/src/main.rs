@@ -8,7 +8,7 @@ use std::hash::Hash;
 use std::io::Write;
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{exit, ExitCode};
+use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aya::maps::{MapData, Stack, StackTraceMap};
@@ -21,7 +21,7 @@ use capable_common::{Nsid, Pid, Request};
 use capctl::{ambient, Cap, CapSet, CapState, ParseCapError};
 use log::{debug, warn};
 use nix::sys::signal::kill;
-use nix::sys::wait::{self, waitpid, WaitPidFlag, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, getpid, ForkResult, Uid};
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::TERM_SIGNALS;
@@ -35,7 +35,7 @@ use syscalls::SyscallAccessEntry;
 use tabled::settings::object::Columns;
 use unshare::ExitStatus;
 
-use tabled::settings::{format, Modify, Style, Width};
+use tabled::settings::{Modify, Style, Width};
 use tabled::{Table, Tabled};
 use tracing::Level;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -777,11 +777,6 @@ fn main() -> Result<(), anyhow::Error> {
 
     debug!("setting capabilities");
 
-    //let mut capstate = CapState::get_current().expect("Failed to get current cap");
-    //capstate.inheritable = CapSet::empty();
-    //capstate.effective = CapSet::empty();
-    //capstate.set_current().expect("Failed to set current cap");
-
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
@@ -937,16 +932,6 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             }
-
-            //let monitor_task = {
-            //    tokio::spawn( async move {
-            //        if let Err(e) = run_dbus_monitor(token).await {
-            //            eprintln!("Error in dbus monitor: {}", e);
-            //        }
-            //    })
-            //};
-            
-            
         }
     }
     Ok(())

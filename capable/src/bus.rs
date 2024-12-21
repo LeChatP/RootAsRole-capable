@@ -213,7 +213,8 @@ pub fn get_dbus_methods<P:AsRef<Path>>(path : P, nsid : Rc<RefCell<u32>>) -> Res
     //read json file
     let content = read_to_string(path).expect("failed to read file");
     let content: HashMap<u32,Vec<DbusMsg>> = serde_json::from_str(&content).unwrap();
-    let requests = content.get(&nsid).unwrap();
+    let default = Vec::new();
+    let requests = content.get(&nsid).unwrap_or(&default);
     let mut methods = Vec::new();
     for request in requests {
         if request.msg_type == MessageType::MethodCall {
