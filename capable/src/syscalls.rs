@@ -247,7 +247,7 @@ fn check_directories_access<P:AsRef<Path> + Clone>(initial_path: P, syscall: &Sy
         result.push(SyscallAccessEntry {
             access,
             syscall: syscall.syscall.clone(),
-            path: parent.display().to_string(),
+            path: parent.canonicalize().unwrap_or(parent.to_path_buf()).display().to_string(),
         });
     }
     result
@@ -261,12 +261,12 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<Vec<SyscallAccessEntry>> {
         if *name == syscall.syscall {
             let mut result = Vec::new();
             let path = syscall
-                .args
-                .clone()
-                .into_iter()
-                .nth((*pos).clone().into())
-                .unwrap()
-                .to_string();
+            .args
+            .clone()
+            .into_iter()
+            .nth((*pos).clone().into())
+            .unwrap()
+            .to_string();
             let mut create_or_delete = false;
             let mut access = access.clone();
             match *name {
@@ -333,8 +333,9 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<Vec<SyscallAccessEntry>> {
                 }
             }
             let _ = dac_read_search_effective(false);
+            let abs_path = Path::new(&path).canonicalize().unwrap_or(Path::new(&path).to_path_buf());
             result.push(SyscallAccessEntry {
-                path,
+                path: abs_path.display().to_string(),
                 access,
                 syscall: syscall.syscall.clone(),
             });

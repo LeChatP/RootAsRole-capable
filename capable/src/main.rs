@@ -54,8 +54,8 @@ struct Cli {
     /// Pass all capabilities when executing the command,
     capabilities: CapSet,
 
-    /// Print output in JSON format, ignore stdin/out/err
-    json: bool,
+    /// Specify a file to write policy result, reactivate stdin/out/err
+    output: Option<PathBuf>,
 
     /// Specify a command to execute with arguments
     command: Vec<String>,
@@ -66,8 +66,8 @@ impl Default for Cli {
         Cli {
             sleep: None,
             daemon: false,
+            output: None,
             capabilities: CapSet::empty(),
-            json: false,
             command: Vec::new(),
         }
     }
@@ -436,7 +436,7 @@ fn print_all<T, V>(
     data_map: &mut Stack<T, Request>,
     stacktrace_map: &StackTraceMap<V>,
     ksyms: &std::collections::BTreeMap<u64, String>,
-    json: bool,
+    output: Option<PathBuf>,
 ) -> Result<(), anyhow::Error>
 where
     T: BorrowMut<MapData>,
@@ -444,8 +444,10 @@ where
 {
     let mut capabilities_table = Vec::new();
     process_data_map(data_map, &mut capabilities_table, stacktrace_map, ksyms)?;
-    if json {
-        println!("{}", serde_json::to_string(&capabilities_table)?);
+    if let Some(output) = output {
+        let mut file = File::create(output)?;
+        writeln!(file, "{:?}", serde_json::to_string(&capabilities_table)?)?;
+        file.flush()?;
     } else {
         println!(
             "\n{}",
@@ -573,8 +575,12 @@ where
                     })
                     .unwrap_or(CapSet::empty());
             }
-            "-j" | "--json" => {
-                args.json = true;
+            "-o" | "--output" => {
+                args.output = iter.next().map(|s| PathBuf::from(s.as_ref()));
+            }
+            "-l" | "--log-level" => {
+                let level = iter.next().map(|s| s.as_ref().to_string()).unwrap_or("info".to_string());
+                env::set_var("RUST_LOG", level);
             }
             _ => {
                 if arg.as_ref().starts_with('-') {
@@ -629,17 +635,17 @@ fn run_command(
                 Ok(())
             })
             .unshare(namespaces)
-            .stdout(if cli_args.json {
+            .stdout(if cli_args.output.is_none() {
                 unshare::Stdio::null()
             } else {
                 unshare::Stdio::inherit()
             })
-            .stderr(if cli_args.json {
+            .stderr(if cli_args.output.is_none() {
                 unshare::Stdio::null()
             } else {
                 unshare::Stdio::inherit()
             })
-            .stdin(if cli_args.json {
+            .stdin(if cli_args.output.is_none() {
                 unshare::Stdio::null()
             } else {
                 unshare::Stdio::inherit()
@@ -708,12 +714,14 @@ fn run_command(
 #[cfg(debug_assertions)]
 pub fn subsribe(tool: &str) {
     use std::io;
+
+    use tracing::level_filters::LevelFilter;
     let identity = CString::new(tool).unwrap();
     let options = syslog_tracing::Options::LOG_PID;
     let facility = syslog_tracing::Facility::Auth;
     let _syslog = syslog_tracing::Syslog::new(identity, options, facility).unwrap();
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(env::var("RUST_LOG").unwrap_or("info".to_string()).parse::<LevelFilter>().unwrap())
         .with_file(true)
         .with_line_number(true)
         .with_writer(io::stdout)
@@ -757,6 +765,7 @@ struct ProgramResult {
 const DBUS_JSON_PATH: &str = "/tmp/capable_dbus.json";
 
 fn main() -> Result<(), anyhow::Error> {
+    let mut cli_args = getopt(std::env::args())?;
     subsribe("capable");
     //env_logger::init();
     //ambient::clear().expect("Failed to clear ambiant caps");
@@ -825,7 +834,7 @@ fn main() -> Result<(), anyhow::Error> {
     let ksyms: std::collections::BTreeMap<u64, String> = kernel_symbols()?;
     setbpf_effective(false)?;
     setadmin_effective(false)?;
-    let mut cli_args = getopt(std::env::args())?;
+    
     
     {
         if cli_args.daemon || cli_args.command.is_empty() {
@@ -835,7 +844,7 @@ fn main() -> Result<(), anyhow::Error> {
             while !term.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(400));
             }
-            print_all(&mut requests_map, &stack_traces, &ksyms, cli_args.json)?;
+            print_all(&mut requests_map, &stack_traces, &ksyms, cli_args.output)?;
         } else {
             let nsinode: Rc<RefCell<u32>> = Rc::new(0.into());
             let mut pid = 0;
@@ -868,7 +877,7 @@ fn main() -> Result<(), anyhow::Error> {
                     kill(child, nix::sys::signal::Signal::SIGINT)
                         .expect("failed to send SIGINT to child");
                     waitpid(child, Some(WaitPidFlag::empty()))?;
-                    if !exit.success() && !cli_args.json {
+                    if !exit.success() && cli_args.output.is_none() {
                         eprintln!("Command failed with exit status: {}", exit);
                         eprintln!("Please check the command and try again with requested capabilities as you want to reach");
                     }
@@ -902,28 +911,16 @@ fn main() -> Result<(), anyhow::Error> {
 
                     // dbus filtering
                     let method_list = bus::get_dbus_methods(DBUS_JSON_PATH, nsinode.clone())?;
-
-                    if cli_args.json {
-                        let result = ProgramResult {
-                            capabilities: capset_to_vec(&capset),
-                            files: map,
-                            dbus: method_list,
-                        };
-                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    let result = ProgramResult {
+                        capabilities: capset_to_vec(&capset),
+                        files: map,
+                        dbus: method_list,
+                    };
+                    if let Some(output) = cli_args.output {
+                        let mut file = File::create(output)?;
+                        writeln!(file, "{}", serde_json::to_string_pretty(&result)?)?;
                     } else {
-                        println!("Here's all capabilities intercepted for this program :\n{}\nWARNING: These capabilities aren't mandatory, but can change the behavior of tested program.\nWARNING: CAP_SYS_ADMIN is rarely needed and can be very dangerous to grant",
-                        capset_to_string(&capset));
-                        println!(
-                            "Here's all DAC requests intercepted for this program :\n{}",
-                            map.iter()
-                                .map(|(k, v)| format!("{} : {}", k, v))
-                                .collect::<Vec<String>>()
-                                .join("\n")
-                        );
-                        println!(
-                            "Here's all Dbus messages intercepted for this program :\n{}",
-                            method_list.join(", ")
-                        );
+                        println!("{}", serde_json::to_string_pretty(&result)?);
                     }
                     if !exit.success() {
                         //set the exit code to the command exit code

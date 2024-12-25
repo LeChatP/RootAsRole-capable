@@ -32,3 +32,7 @@ cargo xtask build
 ```bash
 RUST_LOG=info cargo xtask run
 ```
+
+## Notice
+
+This project is a Proof of Concept and is not intended to be used in production. It should be used only in test environments. However, command output may be useful to help you configure your access policy.
