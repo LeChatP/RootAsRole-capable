@@ -11,7 +11,7 @@ use aya_ebpf::{
     helpers::{bpf_get_current_task, bpf_get_current_uid_gid, bpf_probe_read_kernel}, macros::{kprobe, map}, maps::stack_trace::StackTrace, programs::ProbeContext
 };
 use aya_ebpf::maps::Stack;
-use vmlinux::{ns_common, nsproxy, pid_namespace, task_struct};
+use vmlinux::{ns_common, pid_namespace, task_struct};
 use capable_common::Request;
 
 #[kprobe]
@@ -73,15 +73,14 @@ unsafe fn get_parent_ns_inode(task: TaskStructPtr) -> Result<u32, i64> {
 
 
 pub unsafe fn get_ns_inode(task: TaskStructPtr) -> Result<u32, i64> {
-    let nsp: *mut nsproxy = bpf_probe_read_kernel(&(*task).nsproxy).map_err(|e| e as u32)?;
+    let nsp = bpf_probe_read_kernel(&(*task).nsproxy).map_err(|e| e as u32)?;
     let pns: *mut pid_namespace =
         bpf_probe_read_kernel(&(*nsp).pid_ns_for_children).map_err(|e| e as u32)?;
     let nsc: ns_common = bpf_probe_read_kernel(&(*pns).ns).map_err(|e| e as u32)?;
     bpf_probe_read_kernel(&nsc.inum)
 }
 
-
-
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { core::hint::unreachable_unchecked() }

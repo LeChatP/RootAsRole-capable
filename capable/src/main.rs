@@ -806,14 +806,10 @@ fn main() -> Result<(), anyhow::Error> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    #[cfg(debug_assertions)]
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/debug/capable"
-    ))?;
-    #[cfg(not(debug_assertions))]
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/capable"
-    ))?;
+    let mut bpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/capable"
+    )))?;
 
     if let Err(e) = EbpfLogger::init(&mut bpf) {
         // This can happen if you remove all log statements from your eBPF program.
