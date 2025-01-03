@@ -115,7 +115,7 @@ pub(crate) fn run_dbus_monitor(
     d_data: Arc<Memory>,
 ) -> Result<HashMap<u32,Vec<DbusMsg>>, Error> {
     // First open up a connection to the desired bus.
-    let conn = Connection::new_system().expect("D-Bus connection failed");
+    let conn = Connection::new_system()?;
 
     // Second create a rule to match messages we want to receive; in this example we add no
     // further requirements, so all messages will match

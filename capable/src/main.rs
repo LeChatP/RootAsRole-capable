@@ -860,12 +860,15 @@ fn main() -> Result<(), anyhow::Error> {
                         flag::register(*sig, Arc::clone(&term_now.cancel))?;
                     }
                     nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).expect("Failed to setuid");
-                    let res= run_dbus_monitor(term_now.clone());
-                    //debug!("MEMORY : {:?}", term_now);
-                    let mut file = File::create(DBUS_JSON_PATH)?;
-                    write!(file,"{}",&serde_json::to_string(&(res?))?)?;
-                    file.flush()?;
+                    if let Ok(res) = run_dbus_monitor(term_now.clone()) {
+                        //debug!("MEMORY : {:?}", term_now);
+                        let mut file = File::create(DBUS_JSON_PATH)?;
+                        write!(file,"{}",&serde_json::to_string(&res)?)?;
+                        file.flush()?;
+                        
+                    }
                     exit(0);
+
                 }
                 // let's setuid(root)
                 ForkResult::Parent { child } => {
@@ -906,7 +909,13 @@ fn main() -> Result<(), anyhow::Error> {
                     }
 
                     // dbus filtering
-                    let method_list = bus::get_dbus_methods(DBUS_JSON_PATH, nsinode.clone())?;
+                    // if DBUS_JSON_PATH exists, we will use it to filter the dbus methods
+                    let method_list = if metadata(DBUS_JSON_PATH).is_ok() {
+                        bus::get_dbus_methods(DBUS_JSON_PATH, nsinode.clone())?
+                    } else {
+                        vec![]
+                    };
+                     
                     let result = ProgramResult {
                         capabilities: capset_to_vec(&capset),
                         files: map,
