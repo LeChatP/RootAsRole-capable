@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context;
 use aya::maps::{MapData, Stack, StackTraceMap};
 use aya::programs::KProbe;
 use aya::util::{kernel_symbols, KernelVersion};
@@ -275,10 +276,6 @@ where
     })
 }
 
-fn find_strace() -> Option<PathBuf> {
-    find_from_envpath(&"strace".to_string())
-}
-
 fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
     let mut exec_path: PathBuf = command[0].parse().expect("Failed to get exec path to PathBuf");
     let mut exec_args;
@@ -288,7 +285,7 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
         .to_str()
         .expect("Failed to get exec path to string (canonicalize)")
         .to_string();
-    if let Some(strace) = find_strace() {
+    if let Ok(strace) = which::which("strace") {
         exec_path = strace;
         exec_args = vec![
             "-f".to_string(),
@@ -298,9 +295,11 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
             format!("/tmp/capable_strace_{}.log", getpid()),
         ];
         exec_args.extend(command.clone());
-    } else {
-        exec_path = PathBuf::from("/bin/sh");
+    } else if let Ok(sh) = which::which("sh") {
+        exec_path = sh;
         exec_args = vec!["-c".to_string(), shell_words::join(command)];
+    } else {
+        panic!("Failed to find sh or strace in $PATH");
     }
     (exec_path, exec_args)
 }
@@ -765,7 +764,7 @@ struct ProgramResult {
 const DBUS_JSON_PATH: &str = "/tmp/capable_dbus.json";
 
 fn main() -> Result<(), anyhow::Error> {
-    let mut cli_args = getopt(std::env::args())?;
+    let mut cli_args = getopt(std::env::args()).context("Arguments error")?;
     subsribe("capable");
     //env_logger::init();
     //ambient::clear().expect("Failed to clear ambiant caps");
@@ -775,7 +774,7 @@ fn main() -> Result<(), anyhow::Error> {
         let major = version::LINUX_VERSION_CODE >> 16;
         let minor = (version::LINUX_VERSION_CODE >> 8) & 0xff;
         let patch = version::LINUX_VERSION_CODE & 0xff;
-        let current = KernelVersion::current()?.code();
+        let current = KernelVersion::current().context("Unable to get kernel version")?.code();
         let current_major = current >> 16;
         let current_minor = (current >> 8) & 0xff;
         let current_patch = current & 0xff;
@@ -818,7 +817,7 @@ fn main() -> Result<(), anyhow::Error> {
     debug!("loading and attaching program {}", "capable");
     setbpf_effective(true)?;
     setadmin_effective(true)?;
-    let program: &mut KProbe = bpf.program_mut("capable").expect("failed to get Kprobe capable program").try_into()?;
+    let program: &mut KProbe = bpf.program_mut("capable").expect("failed to get Kprobe capable program").try_into().context("Failed to get Kprobe")?;
     program.load()?;
     program.attach("cap_capable", 0)?;
     setbpf_effective(false)?;
@@ -888,19 +887,22 @@ fn main() -> Result<(), anyhow::Error> {
                         &ksyms,
                     )
                     .expect("failed to print capabilities");
-
-                    let access: Vec<SyscallAccessEntry> =
-                        read_strace(format!("/tmp/capable_strace_{}.log", getpid()))?
-                            .iter()
-                            .map(|syscall| {
-                                if syscall.syscall.trim() == "ptrace" {
-                                    capset.add(Cap::SYS_PTRACE);
-                                }
-                                syscalls::syscall_to_entry(syscall)
-                            })
-                            .flatten()
-                            .flatten()
-                            .collect();
+                    let file_path= format!("/tmp/capable_strace_{}.log", getpid());
+                    let access: Vec<SyscallAccessEntry> = if metadata(&file_path).is_ok() {
+                        read_strace(file_path)?
+                        .iter()
+                        .map(|syscall| {
+                            if syscall.syscall.trim() == "ptrace" {
+                                capset.add(Cap::SYS_PTRACE);
+                            }
+                            syscalls::syscall_to_entry(syscall)
+                        })
+                        .flatten()
+                        .flatten()
+                        .collect()
+                    } else {
+                        vec![]
+                    };
                     let mut map = std::collections::HashMap::new();
                     for entry in access {
                         let key = entry.path.clone();
