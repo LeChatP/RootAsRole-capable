@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
                 "src/version.rs",
                 format!("pub const LINUX_VERSION_CODE: u32 = {};", version.code()),
             )
-            .unwrap();
+            .expect("Unable to write version.rs file");
         }
         Err(e) => eprintln!("Error: {}", e),
     };

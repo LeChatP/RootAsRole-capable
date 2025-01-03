@@ -280,13 +280,13 @@ fn find_strace() -> Option<PathBuf> {
 }
 
 fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
-    let mut exec_path: PathBuf = command[0].parse().unwrap();
+    let mut exec_path: PathBuf = command[0].parse().expect("Failed to get exec path to PathBuf");
     let mut exec_args;
     // encapsulate the command in sh command
     command[0] = canonicalize(exec_path.clone())
         .unwrap_or(exec_path)
         .to_str()
-        .unwrap()
+        .expect("Failed to get exec path to string (canonicalize)")
         .to_string();
     if let Some(strace) = find_strace() {
         exec_path = strace;
@@ -401,7 +401,7 @@ where
             && skip_priv_sym(&stack, ksyms, "may_open"))
             || capability == Cap::SYS_PTRACE as u8)
         {
-            entry.add(get_cap(capability).unwrap());
+            entry.add(get_cap(capability).expect(&format!("Unknown capability: {}", capability)));
             // debug the stack trace
             for frame in stack.frames() {
                 if let Some(sym) = ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
@@ -655,7 +655,7 @@ fn run_command(
     ));
     setadmin_effective(false)?;
     let cloned = child.clone();
-    *pid = child.try_lock().unwrap().id() as i32;
+    *pid = child.try_lock().expect("failed to lock execution child").id() as i32;
     let pid_cloned = pid.clone();
     let term = Arc::new(AtomicBool::new(false));
     for sig in TERM_SIGNALS {
@@ -681,7 +681,7 @@ fn run_command(
             eprintln!("SIGINT wait is timed-out\n");
             child
                 .try_lock()
-                .unwrap()
+                .expect("failed to lock execution child for sending SIGKILL")
                 .kill()
                 .expect("failed to send SIGKILL");
             i = 0;
@@ -702,7 +702,7 @@ fn run_command(
 
     let exit_status = cloned
         .try_lock()
-        .unwrap()
+        .expect("failed to lock execution child for waiting")
         .wait()
         .expect("failed to wait on child");
     debug!("child exited with {:?}", exit_status);
@@ -716,12 +716,12 @@ pub fn subsribe(tool: &str) {
     use std::io;
 
     use tracing::level_filters::LevelFilter;
-    let identity = CString::new(tool).unwrap();
+    let identity = CString::new(tool).expect("Failed to create CString");
     let options = syslog_tracing::Options::LOG_PID;
     let facility = syslog_tracing::Facility::Auth;
-    let _syslog = syslog_tracing::Syslog::new(identity, options, facility).unwrap();
+    let _syslog = syslog_tracing::Syslog::new(identity, options, facility).expect("Failed to create syslog");
     tracing_subscriber::fmt()
-        .with_max_level(env::var("RUST_LOG").unwrap_or("info".to_string()).parse::<LevelFilter>().unwrap())
+        .with_max_level(env::var("RUST_LOG").unwrap_or("info".to_string()).parse::<LevelFilter>().expect("Failed to parse log level"))
         .with_file(true)
         .with_line_number(true)
         .with_writer(io::stdout)
@@ -733,10 +733,10 @@ pub fn subsribe(tool: &str) {
 pub fn subsribe(tool: &str) {
     use std::panic::set_hook;
 
-    let identity = CString::new(tool).unwrap();
+    let identity = CString::new(tool).expect("Failed to create CString");
     let options = syslog_tracing::Options::LOG_PID;
     let facility = syslog_tracing::Facility::Auth;
-    let syslog = syslog_tracing::Syslog::new(identity, options, facility).unwrap();
+    let syslog = syslog_tracing::Syslog::new(identity, options, facility).expect("Failed to create syslog");
     tracing_subscriber::fmt()
         .compact()
         .with_max_level(Level::WARN)
@@ -818,15 +818,15 @@ fn main() -> Result<(), anyhow::Error> {
     debug!("loading and attaching program {}", "capable");
     setbpf_effective(true)?;
     setadmin_effective(true)?;
-    let program: &mut KProbe = bpf.program_mut("capable").unwrap().try_into()?;
+    let program: &mut KProbe = bpf.program_mut("capable").expect("failed to get Kprobe capable program").try_into()?;
     program.load()?;
     program.attach("cap_capable", 0)?;
     setbpf_effective(false)?;
     setadmin_effective(false)?;
     debug!("program {} loaded and attached", "capable");
     let mut requests_map: Stack<_, Request> =
-        Stack::try_from(bpf.take_map("ENTRY_STACK").unwrap())?;
-    let stack_traces = StackTraceMap::try_from(bpf.borrow().map("STACKTRACE_MAP").unwrap())?;
+        Stack::try_from(bpf.take_map("ENTRY_STACK").expect("Unable to obtain Stack requests"))?;
+    let stack_traces = StackTraceMap::try_from(bpf.borrow().map("STACKTRACE_MAP").expect("unable to get Stacktrace map"))?;
     let ksyms: std::collections::BTreeMap<u64, String> = kernel_symbols()?;
     setbpf_effective(false)?;
     setadmin_effective(false)?;

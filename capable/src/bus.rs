@@ -20,10 +20,15 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::debug;
+use tracing_subscriber::fmt::format;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DbusMsg {
-    #[serde(rename = "type", serialize_with = "msg_type_to_string", deserialize_with = "msg_type_from_string")]
+    #[serde(
+        rename = "type",
+        serialize_with = "msg_type_to_string",
+        deserialize_with = "msg_type_from_string"
+    )]
     msg_type: MessageType,
     #[serde(skip_serializing_if = "Option::is_none")]
     sender: Option<String>,
@@ -57,7 +62,7 @@ struct ConnectionCredentials {
     unix_group_ids: Vec<u32>,
 }
 
-#[derive(PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
 pub struct MsgKey {
     sender: String,
     serial: u32,
@@ -74,8 +79,6 @@ pub struct Memory {
     //                "1.21"  [ "org.freedesktop.systemd1.Manager.Reboot" ]
     pub requests: DashMap<String, Vec<DbusMsg>>,
 }
-
-
 
 impl Default for Memory {
     fn default() -> Self {
@@ -106,14 +109,15 @@ where
         "MethodReturn" => Ok(MessageType::MethodReturn),
         "Error" => Ok(MessageType::Error),
         "Signal" => Ok(MessageType::Signal),
-        _ => Err(serde::de::Error::custom(format!("Unknown message type: {}", s))),
+        _ => Err(serde::de::Error::custom(format!(
+            "Unknown message type: {}",
+            s
+        ))),
     }
 }
 
 // This programs implements the equivalent of running the "dbus-monitor" tool
-pub(crate) fn run_dbus_monitor(
-    d_data: Arc<Memory>,
-) -> Result<HashMap<u32,Vec<DbusMsg>>, Error> {
+pub(crate) fn run_dbus_monitor(d_data: Arc<Memory>) -> Result<HashMap<u32, Vec<DbusMsg>>, Error> {
     // First open up a connection to the desired bus.
     let conn = Connection::new_system()?;
 
@@ -185,7 +189,8 @@ pub(crate) fn run_dbus_monitor(
     // Loop and print out all messages received (using handle_message()) as they come.
     // Some can be quite large, e.g. if they contain embedded images..
     while d_data.cancel.load(std::sync::atomic::Ordering::Relaxed) == false {
-        conn.process(Duration::from_millis(1000)).unwrap();
+        conn.process(Duration::from_millis(1000))
+            .expect("dbus process() failed");
     }
 
     // join d_data.owners and d_data.requests
@@ -199,7 +204,10 @@ pub(crate) fn run_dbus_monitor(
                 if !nsid_to_requests.contains_key(nsid) {
                     nsid_to_requests.insert(*nsid, Vec::new());
                 }
-                nsid_to_requests.get_mut(nsid).unwrap().extend(requests.value().clone());
+                nsid_to_requests
+                    .get_mut(nsid)
+                    .expect(&format!("Failed to get nsid {}", nsid))
+                    .extend(requests.value().clone());
             }
         }
     });
@@ -207,27 +215,38 @@ pub(crate) fn run_dbus_monitor(
     Ok(nsid_to_requests)
 }
 
-pub fn get_dbus_methods<P:AsRef<Path>>(path : P, nsid : Rc<RefCell<u32>>) -> Result<Vec<String>, Error> {
+pub fn get_dbus_methods<P: AsRef<Path>>(
+    path: P,
+    nsid: Rc<RefCell<u32>>,
+) -> Result<Vec<String>, Error> {
     let path = path.as_ref();
     let nsid = nsid.borrow();
     //read json file
     let content = read_to_string(path).expect("failed to read file");
-    let content: HashMap<u32,Vec<DbusMsg>> = serde_json::from_str(&content).unwrap();
+    let content: HashMap<u32, Vec<DbusMsg>> =
+        serde_json::from_str(&content).expect("failed to parse dbus json");
     let default = Vec::new();
     let requests = content.get(&nsid).unwrap_or(&default);
     let mut methods = Vec::new();
     for request in requests {
         if request.msg_type == MessageType::MethodCall {
-            methods.push(format!("{}.{}", request.interface.as_ref().unwrap(), request.method.as_ref().unwrap()));
+            methods.push(format!(
+                "{}.{}",
+                request
+                    .interface
+                    .as_ref()
+                    .expect(&format!("Unknown interface for {:?}", request)),
+                request
+                    .method
+                    .as_ref()
+                    .expect(&format!("Unknown method for {:?}", request))
+            ));
         }
     }
     Ok(methods)
 }
 
-fn handle_message(
-    data: Arc<Memory>,
-    msg: &Message,
-) {
+fn handle_message(data: Arc<Memory>, msg: &Message) {
     let sender = msg.sender().map(|x| x.to_string());
     let dest = msg.destination().map(|x| x.to_string());
     let dbus_msg = DbusMsg {
@@ -239,7 +258,9 @@ fn handle_message(
         } else {
             msg.get_serial()
         },
-        interface: msg.interface().map(|x| x.to_string().trim_matches('"').to_string()),
+        interface: msg
+            .interface()
+            .map(|x| x.to_string().trim_matches('"').to_string()),
         method: msg.member().map(|x| x.to_string()),
         path: msg.path().map(|x| x.to_string()),
         arguments: if msg.iter_init().count() > 0 {
@@ -253,49 +274,77 @@ fn handle_message(
         },
     };
 
-    let key = dest.map(|dest| {
-        MsgKey {
-            sender: dest,
-            serial: dbus_msg.serial.unwrap(),
-        }
+    let key = dest.map(|dest| MsgKey {
+        sender: dest,
+        serial: dbus_msg
+            .serial
+            .expect(&format!("No serial for {:?}", dbus_msg)),
     });
-    
+
     if dbus_msg.msg_type == MessageType::MethodCall
-        && dbus_msg.method
-            .as_ref().is_some_and(|x| x == "GetConnectionCredentials")
+        && dbus_msg
+            .method
+            .as_ref()
+            .is_some_and(|x| x == "GetConnectionCredentials")
     {
         let key = MsgKey {
-            sender: sender.clone().unwrap(),
-            serial: dbus_msg.serial.unwrap(),
+            sender: sender
+                .clone()
+                .expect(&format!("No sender for {:?}", dbus_msg)),
+            serial: dbus_msg
+                .serial
+                .expect(&format!("No serial for {:?}", dbus_msg)),
         };
         data.credentials_requests.insert(
             key,
-            msg.get1().unwrap(),
+            msg.get1().expect(&format!("No get1() for {:?}", dbus_msg)),
         );
     } else if dbus_msg.msg_type == MessageType::MethodReturn
-        && key.as_ref().is_some_and( |key| data.credentials_requests.contains_key(&key) )
+        && key
+            .as_ref()
+            .is_some_and(|key| data.credentials_requests.contains_key(&key))
     {
-        let map : HashMap<String,Variant<Box<dyn RefArg>>> = msg.get1().unwrap();
-        let process_id = map.get("ProcessID").unwrap().0.as_u64().unwrap() as i32;
+        let map: HashMap<String, Variant<Box<dyn RefArg>>> =
+            msg.get1().expect("Impossible error get1()");
+        let process_id = map
+            .get("ProcessID")
+            .expect("Unable to get ProcessID")
+            .0
+            .as_u64()
+            .expect("Unable to convert ProcessID to u64") as i32;
         // read /proc/<pid>/name to get the path of the socket
-        let nspid =
-                    metadata(format!("/proc/{}/ns/pid", process_id)).expect("failed to open pid ns").ino() as u32;
-        let dbus_id = data.credentials_requests.get(&key.unwrap()).unwrap().to_string();
+        let nspid = metadata(format!("/proc/{}/ns/pid", process_id))
+            .expect("failed to open pid ns")
+            .ino() as u32;
+        let dbus_id = data
+            .credentials_requests
+            .get(key.as_ref().expect("Unable to get the key (Impossible)"))
+            .expect(&format!("Unable to get the creential_request for key {:?}", key.as_ref()))
+            .to_string();
         let array = data.owners.get_mut(&nspid);
         match array {
             Some(mut array) => {
                 if !array.contains(&dbus_id) {
-                    debug!("We know that ProcessID: {} is DbusID: {}, which is under {} namespace", process_id, dbus_id, nspid);
+                    debug!(
+                        "We know that ProcessID: {} is DbusID: {}, which is under {} namespace",
+                        process_id, dbus_id, nspid
+                    );
                     array.push(dbus_id);
                 }
             }
             None => {
-                debug!("We know that ProcessID: {} is DbusID: {}, which is under {} namespace", process_id, dbus_id, nspid);
+                debug!(
+                    "We know that ProcessID: {} is DbusID: {}, which is under {} namespace",
+                    process_id, dbus_id, nspid
+                );
                 data.owners.insert(nspid, vec![dbus_id]);
             }
         }
     } else if dbus_msg.msg_type == MessageType::MethodCall {
-        data.requests.entry(sender.unwrap()).or_insert(Vec::new()).push(dbus_msg.clone());
+        data.requests
+            .entry(sender.expect("No sender for the message"))
+            .or_insert(Vec::new())
+            .push(dbus_msg.clone());
     }
-    data.messages.lock().unwrap().push(dbus_msg);
+    data.messages.lock().expect("unable to lock Mutex Memory messages").push(dbus_msg);
 }

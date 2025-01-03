@@ -114,7 +114,7 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
                     match inner_pair.as_rule() {
                         Rule::key => {
                             let key = inner_pair.as_str().to_string();
-                            let value = inner.next().unwrap().as_str().to_string();
+                            let value = inner.next().expect("Unable to get value from key=value structure strace").as_str().to_string();
                             map.insert(key, value);
                         }
                         _ => {
@@ -128,7 +128,7 @@ fn parse_syscall(pair: pest::iterators::Pair<'_, Rule>, syscalls: &mut Vec<Sysca
                 for inner_pair in pair.into_inner() {
                     match inner_pair.as_rule() {
                         Rule::return_value => {
-                            syscall.return_code.code = inner_pair.as_str().trim().parse().unwrap()
+                            syscall.return_code.code = inner_pair.as_str().trim().parse().expect("Unable to parse return code");
                         }
                         Rule::constant => {
                             syscall.return_code.constant = Some(inner_pair.as_str().to_string())

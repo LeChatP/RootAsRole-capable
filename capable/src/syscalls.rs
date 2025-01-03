@@ -226,7 +226,7 @@ fn check_directories_access<P:AsRef<Path> + Clone>(initial_path: P, syscall: &Sy
     let mut result = Vec::new();
     let mut parent = initial_path.as_ref();
     while parent.parent().is_some() {
-        parent = parent.parent().unwrap();
+        parent = parent.parent().expect("No parent found (impossible)");
         let metadata = match fs::symlink_metadata(&parent) {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -234,7 +234,7 @@ fn check_directories_access<P:AsRef<Path> + Clone>(initial_path: P, syscall: &Sy
                 continue;
             }
         };
-        let mode = Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().unwrap());
+        let mode = Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().expect("Invalid Access mode"));
         let access = Access::X | if create_or_delete && initial_path.as_ref().parent() == Some(parent) {
             Access::W
         } else {
@@ -265,7 +265,7 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<Vec<SyscallAccessEntry>> {
             .clone()
             .into_iter()
             .nth((*pos).clone().into())
-            .unwrap()
+            .expect(&format!("No argument found for syscall {} at position {}", syscall.syscall, pos))
             .to_string();
             let mut create_or_delete = false;
             let mut access = access.clone();
@@ -320,7 +320,7 @@ pub fn syscall_to_entry(syscall: &Syscall) -> Option<Vec<SyscallAccessEntry>> {
                 // TODO: Add folder permission checks
                 Ok(metadata) => {
                     let mode =
-                        Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().unwrap());
+                        Access::from_bits_truncate((metadata.st_mode() & 0o7).try_into().expect("Invalid Access mode from file metadata"));
                     // if mode is a superset then None
                     if access.intersection(mode).eq(&access) {
                         debug!("{} has {} rights for others, so ignoring", path, mode);
