@@ -1,7 +1,5 @@
 use std::{
-    fs,
-    os::linux::fs::MetadataExt,
-    path::Path,
+    fmt::Display, fs, os::linux::fs::MetadataExt, path::Path
 };
 
 use bitflags::bitflags;
@@ -32,6 +30,28 @@ impl Into<usize> for Pos {
             Pos::Five => 4,
             _ => panic!("Invalid conversion"),
         }
+    }
+}
+
+impl Display for Pos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut pos = Vec::new();
+        if self.contains(Pos::One) {
+            pos.push("1");
+        }
+        if self.contains(Pos::Two) {
+            pos.push("2");
+        }
+        if self.contains(Pos::Three) {
+            pos.push("3");
+        }
+        if self.contains(Pos::Four) {
+            pos.push("4");
+        }
+        if self.contains(Pos::Five) {
+            pos.push("5");
+        }
+        write!(f, "{}", pos.join(","))
     }
 }
 
