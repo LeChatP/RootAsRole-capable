@@ -566,6 +566,9 @@ where
                 args.capabilities = iter
                     .next()
                     .and_then(|s| {
+                        if s.as_ref().to_ascii_uppercase() == "ALL" {
+                            return Some(capctl::bounding::probe());
+                        }
                         Some(
                             parse_capset_iter(s.as_ref().split(','))
                                 .ok()
