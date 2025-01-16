@@ -1,38 +1,34 @@
 # RootAsRole-capable
 
-This side project is a proof of concept for helping people to configure their access policy in the [RootAsRole](https://github.com/LeChatP/RootAsRole) project.
-
 ## Prerequisites
 
-1. Install bpf-linker: `cargo install bpf-linker`
+We assume that you already installed the RootAsRole `sr` tool. We recommend to use it to take advantage of this project.
 
-## Build eBPF
-
-```bash
-cargo xtask build-ebpf
+Many packages are required to build and run this project. The following is the command for installing them all on an Docker Image Ubuntu 22.04:
+```shell
+sr apt install clang curl build-essential libelf-dev llvm \
+                linux-tools-generic binutils-dev libcap-dev libclang-dev \
+                libdbus-1-dev pkg-config libacl1-dev strace
 ```
 
-To perform a release build you can use the `--release` flag.
-You may also change the target architecture with the `--target` flag.
+In addition to the above packages, the following are also required:
 
-## Build Userspace
+1. stable rust toolchains: `rustup toolchain install stable`
+1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
+1. bpftool: [Compile it by following the Github](https://github.com/libbpf/bpftool) (or use the following commands copied from the Github)
+    1. `git clone --recurse-submodules https://github.com/libbpf/bpftool.git`
+    1. `cd bpftool/src`
+    1. `sr make install`
+1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+1. bindgen-cli: `cargo install bindgen-cli`
 
-```bash
-cargo build
+## Build & Run
+
+Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+
+```shell
+cargo run --release --config 'target."cfg(all())".runner="sr"'
 ```
 
-## Build eBPF and Userspace
-
-```bash
-cargo xtask build
-```
-
-## Run
-
-```bash
-RUST_LOG=info cargo xtask run
-```
-
-## Notice
-
-This project is a Proof of Concept and is not intended to be used in production. It should be used only in test environments. However, command output may be useful to help you configure your access policy.
+Cargo build scripts are used to automatically build the eBPF correctly and include it in the
+program.
