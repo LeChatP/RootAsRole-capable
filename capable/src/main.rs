@@ -762,6 +762,7 @@ struct ProgramResult {
     capabilities: Vec<String>,
     files: std::collections::HashMap<String, syscalls::Access>,
     dbus: Vec<String>,
+    env_vars: std::collections::HashMap<String, String>,
 }
 
 const DBUS_JSON_PATH: &str = "/tmp/capable_dbus.json";
@@ -920,11 +921,17 @@ fn main() -> Result<(), anyhow::Error> {
                     } else {
                         vec![]
                     };
+
+                    let mut env_vars = std::collections::HashMap::new();
+                    for (key,value) in env::vars() {
+                        env_vars.insert(key, value);
+                    }
                      
                     let result = ProgramResult {
                         capabilities: capset_to_vec(&capset),
                         files: map,
                         dbus: method_list,
+                        env_vars: env_vars,
                     };
                     if let Some(output) = cli_args.output {
                         let mut file = File::create(output)?;
