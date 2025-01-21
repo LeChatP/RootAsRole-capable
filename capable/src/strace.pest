@@ -1,5 +1,5 @@
 file= _{ SOI ~ (syscall_call | exit)* ~ EOI }
-syscall_call = { pid? ~ syscall ~ "(" ~ arguments+ ~ ")" ~ "=" ~ return_code ~ NEWLINE? | signal ~ NEWLINE? }
+syscall_call = { pid? ~ syscall ~ "(" ~ arguments+ ~ (")" ~ "=" ~ return_code)? ~ NEWLINE? | signal ~ NEWLINE? }
 arguments = _{ argument ~ ("," ~ arguments)? }
 syscall = { (CASED_LETTER | ASCII_DIGIT)+ }
 argument = _{ array | string_quote | structure | constant | unfinished | comment | detach }
@@ -9,7 +9,7 @@ string = { (( "\\\"" | !"\"" ) ~ ANY)* }
 array = {"[" ~ (!"]" ~ string_list) ~ "]"}
 constant = { ('a'..'z'|'A'..'Z'|"_"|'0'..'9'|"|"|"-")+ }
 comment = { "/*"  ~ (!"*/" ~ ANY)+ ~ "*/" }
-detach = { "<detached ...>" }
+detach = { "<detached ...>" ~ NEWLINE }
 return_code = { return_value ~ constant? ~ message? }
 return_value = { "-"? ~ ASCII_DIGIT+ }
 message = { "(" ~ (( "\\(" | !")" ) ~ ANY)+ ~ ")" }
