@@ -288,6 +288,8 @@ fn get_exec_and_args(command: &mut Vec<String>) -> (PathBuf, Vec<String>) {
     if let Ok(strace) = which::which("strace") {
         exec_path = strace;
         exec_args = vec![
+            "-b".to_string(),
+            "execve".to_string(),
             "-f".to_string(),
             "-e".to_string(),
             "ptrace,file".to_string(),
